@@ -9,7 +9,7 @@ allowed-tools:
 
 > **触发：** 每轮回复生成后
 > **前置：** 用户已注册（fav_ensure 已在回复前执行）
-> **工具：** `fav_add_nickname(user_id, nickname)` — 更新用户当前昵称（偶发）
+> **工具：** `fav_add_nickname`，参数 `{"user_id":"<sender_id>","nickname":"<new_nickname>"}` — 更新用户当前昵称（偶发）
 
 ## 变化幅度参考
 
@@ -25,10 +25,13 @@ allowed-tools:
 
 1. 分析本轮用户输入的情感倾向，按上表确定 `delta`
 2. 若 `delta ≠ 0`：
-   - `fav_delta(sender_id, delta)` — 直接施加变化量，无需先查询
-3. 若用户在本轮提及新称呼：`fav_add_nickname(sender_id, new_nickname)`
+   - 调用 `fav_delta`，参数必须为 `{"user_id":"<sender_id>","delta":<integer>}`，直接施加变化量，无需先查询
+3. 若用户在本轮提及新称呼：
+   - 调用 `fav_add_nickname`，参数必须为 `{"user_id":"<sender_id>","nickname":"<new_nickname>"}`
 
 ## 注意
 
 - 好感度会被自动限制在 -100 ~ 100 范围内，无需手动截断。
 - 昵称变更与好感度更新相互独立，可同轮执行。
+- 禁止添加 schema 外参数，尤其是 `_`。
+- 禁止位置参数写法（如 `fav_delta(sender_id, delta)`），仅使用命名参数对象。
