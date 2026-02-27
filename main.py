@@ -529,8 +529,46 @@ class FavorabilityPlugin(Star):
         nickname = user.current_nickname or "无"
 
         yield event.plain_result(
-            f"昵称: {nickname}\n"
+            f"昵称: {nickname}（{sender_id}）\n"
             f"好感度: {user.level}"
+        )
+
+    @filter.command("fav-init")
+    async def cmd_fav_init(self, event: AstrMessageEvent):
+        """在当前会话中注册自己的好感度记录。"""
+        if not self.db:
+            yield event.plain_result("好感度系统未初始化")
+            return
+
+        try:
+            session_type, session_id, sender_name = self._resolve_session_context(event)
+        except ValueError as exc:
+            yield event.plain_result(f"会话上下文异常: {exc}")
+            return
+
+        sender_id = str(event.get_sender_id() or "").strip()
+        if not sender_id:
+            yield event.plain_result("无法获取你的用户 ID")
+            return
+
+        user = self.db.get_user(session_type, session_id, sender_id)
+        if user:
+            yield event.plain_result(f"你已经注册过了，当前好感度: {user.level}")
+            return
+
+        initial_level = self._clamp_level(0)
+        nickname = sender_name or sender_id
+
+        if not self.db.add_user(session_type, session_id, sender_id, initial_level):
+            yield event.plain_result("注册失败，请稍后重试。")
+            return
+
+        self.db.upsert_current_nickname(session_type, session_id, sender_id, nickname)
+
+        yield event.plain_result(
+            f"注册成功！\n"
+            f"昵称: {nickname}\n"
+            f"好感度: {initial_level}"
         )
 
     async def terminate(self):
