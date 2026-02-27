@@ -228,6 +228,51 @@ class FavorabilityPlugin(Star):
             f"当前层级: {tier_info}"
         )
 
+    @llm_tool(name="fav_ensure")
+    async def fav_ensure(self, event: AstrMessageEvent, user_id: str, nickname: str):
+        """查询当前会话内用户的好感度与层级效果；若用户不存在则自动注册。每轮对话开始时调用。
+
+        Args:
+            user_id(string): 用户 ID
+            nickname(string): 用户当前昵称（仅在自动注册时使用）
+        """
+        if not self.db:
+            return "好感度系统未初始化"
+
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            return f"会话上下文异常: {exc}"
+
+        normalized_id = str(user_id or "").strip()
+        if not normalized_id:
+            return "user_id 不能为空"
+
+        user = self.db.get_user(session_type, session_id, normalized_id)
+        registered = False
+
+        if not user:
+            normalized_nickname = str(nickname or "").strip() or normalized_id
+            initial_level = self._clamp_level(0)
+            if not self.db.add_user(session_type, session_id, normalized_id, initial_level):
+                return "自动注册失败"
+            self.db.upsert_current_nickname(
+                session_type, session_id, normalized_id, normalized_nickname
+            )
+            user = self.db.get_user(session_type, session_id, normalized_id)
+            if not user:
+                return "自动注册后查询失败"
+            registered = True
+
+        tier = self._get_tier(user.level)
+        tier_info = f"【{tier['name']}】{tier['effect']}" if tier else "未知层级"
+
+        msg = ""
+        if registered:
+            msg += "[新用户已注册]\n"
+        msg += f"好感度: {user.level}\n当前层级: {tier_info}"
+        return msg
+
     @llm_tool(name="fav_update")
     async def fav_update(self, event: AstrMessageEvent, user_id: str, level: int):
         """设置当前会话内用户的好感度等级（绝对值）。
