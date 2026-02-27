@@ -54,6 +54,8 @@ class FavorabilityPlugin(Star):
         if key not in self._config:
             raise ValueError(f"缺少必填配置项: {key}")
         raw = self._config.get(key)
+        if isinstance(raw, dict) and "value" in raw:
+            raw = raw["value"]
         try:
             return int(raw)
         except (TypeError, ValueError) as exc:
@@ -64,6 +66,8 @@ class FavorabilityPlugin(Star):
             raise ValueError(f"缺少必填配置项: {key}")
 
         raw = self._config.get(key)
+        if isinstance(raw, dict) and "value" in raw:
+            raw = raw["value"]
         if isinstance(raw, str):
             if not raw.strip():
                 raise ValueError("tiers 配置为空")

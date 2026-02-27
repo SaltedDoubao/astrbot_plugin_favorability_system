@@ -1,26 +1,18 @@
 {
   "min_level": {
-    "config_type": "item",
-    "name": "好感度下限",
+    "type": "int",
     "description": "好感度等级的最小值（当前版本固定为 -100）",
-    "path": "min_level",
-    "value": -100,
-    "val_type": "int"
+    "default": -100
   },
   "max_level": {
-    "config_type": "item",
-    "name": "好感度上限",
+    "type": "int",
     "description": "好感度等级的最大值（当前版本固定为 100）",
-    "path": "max_level",
-    "value": 100,
-    "val_type": "int"
+    "default": 100
   },
   "tiers": {
-    "config_type": "item",
-    "name": "好感度层级配置",
-    "description": "JSON 格式的层级定义数组，每项包含 name（层级名）、min（最小值）、max（最大值）、effect（效果描述）字段，必须连续覆盖 -100~100",
-    "path": "tiers",
-    "value": "[{\"name\":\"敌对\",\"min\":-100,\"max\":-61,\"effect\":\"强烈反感，尽量回避互动\"},{\"name\":\"冷淡\",\"min\":-60,\"max\":-21,\"effect\":\"态度疏离，交流意愿较低\"},{\"name\":\"中立\",\"min\":-20,\"max\":20,\"effect\":\"保持客观，正常沟通\"},{\"name\":\"友好\",\"min\":21,\"max\":60,\"effect\":\"态度积极，愿意配合\"},{\"name\":\"亲密\",\"min\":61,\"max\":100,\"effect\":\"高度信任，互动自然亲近\"}]",
-    "val_type": "str"
+    "type": "string",
+    "description": "JSON 格式层级定义数组，必须连续覆盖 -100~100，每项包含 name/min/max/effect",
+    "hint": "示例: [{\"name\":\"中立\",\"min\":-20,\"max\":20,\"effect\":\"保持客观\"}]",
+    "default": "[{\"name\":\"敌对\",\"min\":-100,\"max\":-61,\"effect\":\"强烈反感，尽量回避互动\"},{\"name\":\"冷淡\",\"min\":-60,\"max\":-21,\"effect\":\"态度疏离，交流意愿较低\"},{\"name\":\"中立\",\"min\":-20,\"max\":20,\"effect\":\"保持客观，正常沟通\"},{\"name\":\"友好\",\"min\":21,\"max\":60,\"effect\":\"态度积极，愿意配合\"},{\"name\":\"亲密\",\"min\":61,\"max\":100,\"effect\":\"高度信任，互动自然亲近\"}]"
   }
 }
