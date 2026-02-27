@@ -3,7 +3,7 @@ import os
 from typing import Optional
 
 from astrbot.api import llm_tool, logger
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .db import FavorabilityDB, NicknameAmbiguousError, SchemaMismatchError
@@ -502,6 +502,36 @@ class FavorabilityPlugin(Star):
         if not tier:
             return f"等级 {normalized_level} 不在任何已定义的层级范围内"
         return f"等级 {normalized_level} 对应层级【{tier['name']}】：{tier['effect']}"
+
+    @filter.command("好感度查询")
+    async def cmd_fav_query(self, event: AstrMessageEvent):
+        """查询自己在当前会话中的好感度等级和层级信息。"""
+        if not self.db:
+            yield event.plain_result("好感度系统未初始化")
+            return
+
+        try:
+            session_type, session_id, sender_name = self._resolve_session_context(event)
+        except ValueError as exc:
+            yield event.plain_result(f"会话上下文异常: {exc}")
+            return
+
+        sender_id = str(event.get_sender_id() or "").strip()
+        if not sender_id:
+            yield event.plain_result("无法获取你的用户 ID")
+            return
+
+        user = self.db.get_user(session_type, session_id, sender_id)
+        if not user:
+            yield event.plain_result("你还没有被记录在当前会话中哦。")
+            return
+
+        nickname = user.current_nickname or "无"
+
+        yield event.plain_result(
+            f"昵称: {nickname}\n"
+            f"好感度: {user.level}"
+        )
 
     async def terminate(self):
         if self.db:
