@@ -2,7 +2,7 @@ import json
 import os
 from typing import Optional
 
-from astrbot.api import logger
+from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 
@@ -169,7 +169,7 @@ class FavorabilityPlugin(Star):
     def _format_session(self, session_type: str, session_id: str) -> str:
         return f"{session_type}:{session_id}"
 
-    @register.llm_tool(name="fav_query")
+    @llm_tool(name="fav_query")
     async def fav_query(self, event: AstrMessageEvent, identifier: str):
         """查询当前会话内用户的好感度等级和层级效果。identifier 可以是用户 ID 或当前昵称。
 
@@ -224,7 +224,7 @@ class FavorabilityPlugin(Star):
             f"当前层级: {tier_info}"
         )
 
-    @register.llm_tool(name="fav_update")
+    @llm_tool(name="fav_update")
     async def fav_update(self, event: AstrMessageEvent, user_id: str, level: int):
         """设置当前会话内用户的好感度等级（绝对值）。
 
@@ -264,7 +264,7 @@ class FavorabilityPlugin(Star):
             msg += f"\n当前层级: {tier_info}"
         return msg
 
-    @register.llm_tool(name="fav_add_user")
+    @llm_tool(name="fav_add_user")
     async def fav_add_user(self, event: AstrMessageEvent, user_id: str, nickname: str):
         """在当前会话注册新用户并设置当前昵称。初始好感度由配置范围约束。
 
@@ -300,7 +300,7 @@ class FavorabilityPlugin(Star):
             f"「{user_id}」，当前昵称「{normalized_nickname}」，初始好感度: {initial_level}"
         )
 
-    @register.llm_tool(name="fav_remove_user")
+    @llm_tool(name="fav_remove_user")
     async def fav_remove_user(self, event: AstrMessageEvent, user_id: str):
         """删除当前会话内用户及其所有昵称记录。
 
@@ -326,7 +326,7 @@ class FavorabilityPlugin(Star):
             f"用户「{user_id}」及其所有昵称"
         )
 
-    @register.llm_tool(name="fav_add_nickname")
+    @llm_tool(name="fav_add_nickname")
     async def fav_add_nickname(self, event: AstrMessageEvent, user_id: str, nickname: str):
         """更新当前会话内用户的当前昵称，旧昵称会自动沉淀为曾用名。
 
@@ -368,7 +368,7 @@ class FavorabilityPlugin(Star):
 
         return f"已为用户「{user_id}」设置当前昵称「{new_nickname}」"
 
-    @register.llm_tool(name="fav_remove_nickname")
+    @llm_tool(name="fav_remove_nickname")
     async def fav_remove_nickname(self, event: AstrMessageEvent, user_id: str, nickname: str):
         """删除当前会话内用户的当前昵称。
 
@@ -399,7 +399,7 @@ class FavorabilityPlugin(Star):
             "该用户当前无昵称，请使用 fav_add_nickname 设置新的当前昵称。"
         )
 
-    @register.llm_tool(name="fav_get_effect")
+    @llm_tool(name="fav_get_effect")
     async def fav_get_effect(self, event: AstrMessageEvent, level: int):
         """查询指定好感度等级对应的层级名称和效果描述。
 
