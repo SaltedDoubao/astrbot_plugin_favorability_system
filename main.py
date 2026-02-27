@@ -304,6 +304,44 @@ class FavorabilityPlugin(Star):
             f"「{user_id}」，当前昵称「{normalized_nickname}」，初始好感度: {initial_level}"
         )
 
+    @llm_tool(name="fav_delta")
+    async def fav_delta(self, event: AstrMessageEvent, user_id: str, delta: int):
+        """对当前会话内用户的好感度施加相对变化量（正数增加，负数减少），无需先查询当前值。
+
+        Args:
+            user_id(string): 用户 ID
+            delta(number): 好感度变化量，正数增加，负数减少
+        """
+        if not self.db:
+            return "好感度系统未初始化"
+
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            return f"会话上下文异常: {exc}"
+
+        try:
+            delta_value = int(delta)
+        except (TypeError, ValueError):
+            return f"delta {delta} 不是有效整数"
+
+        user = self.db.get_user(session_type, session_id, user_id)
+        if not user:
+            return (
+                f"当前会话（{self._format_session(session_type, session_id)}）中"
+                f"用户「{user_id}」不存在"
+            )
+
+        new_level = self._clamp_level(user.level + delta_value)
+        self.db.update_level(session_type, session_id, user_id, new_level)
+
+        tier = self._get_tier(new_level)
+        tier_info = f"【{tier['name']}】{tier['effect']}" if tier else ""
+        msg = f"「{user_id}」好感度 {user.level:+d} → {new_level}"
+        if tier_info:
+            msg += f"\n当前层级: {tier_info}"
+        return msg
+
     @llm_tool(name="fav_remove_user")
     async def fav_remove_user(self, event: AstrMessageEvent, user_id: str):
         """删除当前会话内用户及其所有昵称记录。
