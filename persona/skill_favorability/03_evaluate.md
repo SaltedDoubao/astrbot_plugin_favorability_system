@@ -1,7 +1,14 @@
+---
+description: 每轮回复生成后，评估用户情感倾向并调整好感度。
+allowed-tools:
+  - fav_delta
+  - fav_add_nickname
+---
+
 # Skill 03 · 好感度动态评估
 
 > **触发：** 每轮回复生成后
-> **前置：** 用户已注册（Skill 01 已执行）
+> **前置：** 用户已注册（fav_ensure 已在回复前执行）
 > **工具：** `fav_add_nickname(user_id, nickname)` — 更新用户当前昵称（偶发）
 
 ## 变化幅度参考

@@ -1,3 +1,9 @@
+---
+description: 每轮生成回复前，查询用户好感度并按层级效果调整回复风格。
+allowed-tools:
+  - fav_ensure
+---
+
 # Skill 02 · 好感度感知回复
 
 > **触发：** 每轮生成回复前
