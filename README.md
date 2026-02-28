@@ -47,6 +47,7 @@ git clone https://github.com/SaltedDoubao/astrbot_plugin_favorability_system.git
 |------|------|
 | `fav-init` | 在当前会话中注册自己的好感度记录 |
 | `好感度查询` | 查询自己在当前会话中的好感度和昵称 |
+| `fav-rl [页码]` | 查看当前会话的好感度排行榜，每页 10 条 |
 
 ## 数据隔离与昵称
 
