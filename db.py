@@ -17,7 +17,9 @@ class NicknameAmbiguousError(RuntimeError):
     def __init__(self, nickname: str, user_ids: list[str]):
         self.nickname = nickname
         self.user_ids = user_ids
-        super().__init__(f"昵称「{nickname}」在当前会话中对应多个用户: {', '.join(user_ids)}")
+        super().__init__(
+            f"昵称「{nickname}」在当前会话中对应多个用户: {', '.join(user_ids)}"
+        )
 
 
 @dataclass
@@ -150,20 +152,26 @@ class FavorabilityDB:
             "created_at",
         }
         if nick_columns != required_nick_columns:
-            raise SchemaMismatchError("nicknames 表结构不符合要求。请删除旧数据库后重建。")
+            raise SchemaMismatchError(
+                "nicknames 表结构不符合要求。请删除旧数据库后重建。"
+            )
 
         if not self._has_unique_index(
             "nicknames",
             ["session_type", "session_id", "user_id", "nickname"],
         ):
-            raise SchemaMismatchError("nicknames 唯一约束不符合要求。请删除旧数据库后重建。")
+            raise SchemaMismatchError(
+                "nicknames 唯一约束不符合要求。请删除旧数据库后重建。"
+            )
 
         if not self._has_index(
             "nicknames",
             "idx_nick_lookup",
             ["session_type", "session_id", "nickname", "is_current"],
         ):
-            raise SchemaMismatchError("nicknames 索引不符合要求。请删除旧数据库后重建。")
+            raise SchemaMismatchError(
+                "nicknames 索引不符合要求。请删除旧数据库后重建。"
+            )
 
     def _get_columns(self, table_name: str) -> set[str]:
         rows = self.conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
@@ -200,7 +208,9 @@ class FavorabilityDB:
             return False
         index_columns = [
             info[2]
-            for info in self.conn.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+            for info in self.conn.execute(
+                f"PRAGMA index_info('{index_name}')"
+            ).fetchall()
         ]
         return index_columns == expected_columns
 
@@ -237,7 +247,9 @@ class FavorabilityDB:
         self.conn.commit()
         return cur.rowcount > 0
 
-    def get_user(self, session_type: str, session_id: str, user_id: str) -> Optional[User]:
+    def get_user(
+        self, session_type: str, session_id: str, user_id: str
+    ) -> Optional[User]:
         """通过会话和用户 ID 查询用户。"""
         row = self.conn.execute(
             """
@@ -254,7 +266,9 @@ class FavorabilityDB:
             session_id=row[1],
             user_id=row[2],
             level=row[3],
-            current_nickname=self.get_current_nickname(session_type, session_id, user_id),
+            current_nickname=self.get_current_nickname(
+                session_type, session_id, user_id
+            ),
             historical_nicknames=self.get_historical_nicknames(
                 session_type, session_id, user_id
             ),

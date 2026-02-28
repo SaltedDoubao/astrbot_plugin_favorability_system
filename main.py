@@ -254,7 +254,9 @@ class FavorabilityPlugin(Star):
         if not user:
             normalized_nickname = str(nickname or "").strip() or normalized_id
             initial_level = self._clamp_level(0)
-            if not self.db.add_user(session_type, session_id, normalized_id, initial_level):
+            if not self.db.add_user(
+                session_type, session_id, normalized_id, initial_level
+            ):
                 return "自动注册失败"
             self.db.upsert_current_nickname(
                 session_type, session_id, normalized_id, normalized_nickname
@@ -414,7 +416,9 @@ class FavorabilityPlugin(Star):
         )
 
     @llm_tool(name="fav_add_nickname")
-    async def fav_add_nickname(self, event: AstrMessageEvent, user_id: str, nickname: str):
+    async def fav_add_nickname(
+        self, event: AstrMessageEvent, user_id: str, nickname: str
+    ):
         """更新当前会话内用户的当前昵称，旧昵称会自动沉淀为曾用名。
 
         Args:
@@ -444,7 +448,9 @@ class FavorabilityPlugin(Star):
         if old_nickname == new_nickname:
             return f"用户「{user_id}」当前昵称已是「{new_nickname}」"
 
-        if not self.db.upsert_current_nickname(session_type, session_id, user_id, new_nickname):
+        if not self.db.upsert_current_nickname(
+            session_type, session_id, user_id, new_nickname
+        ):
             return f"为用户「{user_id}」设置当前昵称失败"
 
         if old_nickname:
@@ -456,7 +462,9 @@ class FavorabilityPlugin(Star):
         return f"已为用户「{user_id}」设置当前昵称「{new_nickname}」"
 
     @llm_tool(name="fav_remove_nickname")
-    async def fav_remove_nickname(self, event: AstrMessageEvent, user_id: str, nickname: str):
+    async def fav_remove_nickname(
+        self, event: AstrMessageEvent, user_id: str, nickname: str
+    ):
         """删除当前会话内用户的当前昵称。
 
         Args:
@@ -478,7 +486,9 @@ class FavorabilityPlugin(Star):
                 f"用户「{user_id}」不存在"
             )
 
-        if not self.db.remove_current_nickname(session_type, session_id, user_id, nickname):
+        if not self.db.remove_current_nickname(
+            session_type, session_id, user_id, nickname
+        ):
             return f"未找到用户「{user_id}」的当前昵称「{nickname}」"
 
         return (
@@ -529,8 +539,7 @@ class FavorabilityPlugin(Star):
         nickname = user.current_nickname or "无"
 
         yield event.plain_result(
-            f"昵称: {nickname}（{sender_id}）\n"
-            f"好感度: {user.level}"
+            f"昵称: {nickname}（{sender_id}）\n好感度: {user.level}"
         )
 
     @filter.command("fav-init")
@@ -566,9 +575,7 @@ class FavorabilityPlugin(Star):
         self.db.upsert_current_nickname(session_type, session_id, sender_id, nickname)
 
         yield event.plain_result(
-            f"注册成功！\n"
-            f"昵称: {nickname}\n"
-            f"好感度: {initial_level}"
+            f"注册成功！\n昵称: {nickname}\n好感度: {initial_level}"
         )
 
     async def terminate(self):
