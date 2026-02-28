@@ -4,3 +4,6 @@ desc: 角色扮演好感度记录系统，通过 LLM 工具函数管理用户好
 version: v1.0.0
 author: SaltedDoubao
 repo: https://github.com/SaltedDoubao/astrbot_plugin_favorability_system
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.0.0"
