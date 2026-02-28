@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 测试环境
+.venv/
+venv/
+env/
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# ruff
+.ruff_cache/
+
+# other
+.local/
