@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from typing import Optional
 
@@ -577,6 +578,50 @@ class FavorabilityPlugin(Star):
         yield event.plain_result(
             f"注册成功！\n昵称: {nickname}\n好感度: {initial_level}"
         )
+
+    @filter.command("fav-rl")
+    async def cmd_fav_ranking(self, event: AstrMessageEvent):
+        """查看当前会话的好感度排行榜。"""
+        if not self.db:
+            yield event.plain_result("好感度系统未初始化")
+            return
+
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            yield event.plain_result(f"会话上下文异常: {exc}")
+            return
+
+        page_str = (event.message_str or "").strip()
+        page = 1
+        if page_str:
+            if not page_str.isdigit() or int(page_str) < 1:
+                yield event.plain_result("页码必须是正整数")
+                return
+            page = int(page_str)
+
+        per_page = 10
+        users, total = self.db.get_ranking(
+            session_type, session_id, per_page, (page - 1) * per_page
+        )
+
+        if total == 0:
+            yield event.plain_result("当前会话还没有好感度记录")
+            return
+
+        total_pages = math.ceil(total / per_page)
+        if page > total_pages:
+            yield event.plain_result(f"页码超出范围，共 {total_pages} 页")
+            return
+
+        lines = ["好感度排行"]
+        for u in users:
+            name = u.current_nickname or u.user_id
+            lines.append(f"{name}（{u.user_id}）：{u.level}")
+        lines.append("---")
+        lines.append(f"{page}/{total_pages}")
+
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         if self.db:

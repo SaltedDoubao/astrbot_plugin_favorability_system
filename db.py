@@ -274,6 +274,47 @@ class FavorabilityDB:
             ),
         )
 
+    def get_ranking(
+        self,
+        session_type: str,
+        session_id: str,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[User], int]:
+        """按好感度降序返回分页用户列表和总数。"""
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM users WHERE session_type = ? AND session_id = ?",
+            (session_type, session_id),
+        ).fetchone()[0]
+
+        rows = self.conn.execute(
+            """
+            SELECT u.user_id, u.level, n.nickname
+            FROM users u
+            LEFT JOIN nicknames n
+              ON u.session_type = n.session_type
+             AND u.session_id = n.session_id
+             AND u.user_id = n.user_id
+             AND n.is_current = 1
+            WHERE u.session_type = ? AND u.session_id = ?
+            ORDER BY u.level DESC
+            LIMIT ? OFFSET ?
+            """,
+            (session_type, session_id, limit, offset),
+        ).fetchall()
+
+        users = [
+            User(
+                session_type=session_type,
+                session_id=session_id,
+                user_id=row[0],
+                level=row[1],
+                current_nickname=row[2],
+            )
+            for row in rows
+        ]
+        return users, total
+
     def find_user_by_current_nickname(
         self, session_type: str, session_id: str, nickname: str
     ) -> Optional[User]:
