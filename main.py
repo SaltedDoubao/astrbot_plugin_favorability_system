@@ -592,13 +592,21 @@ class FavorabilityPlugin(Star):
             yield event.plain_result(f"会话上下文异常: {exc}")
             return
 
-        page_str = (event.message_str or "").strip()
+        raw = (event.message_str or "").strip()
         page = 1
-        if page_str:
-            if not page_str.isdigit() or int(page_str) < 1:
+        if raw:
+            parts = raw.split()
+            if parts and parts[0].lstrip("/!").lower() == "fav-rl":
+                parts = parts[1:]
+            if len(parts) > 1:
+                yield event.plain_result("参数过多，仅支持可选页码：fav-rl [页码]")
+                return
+            page_str = parts[0] if parts else ""
+            if page_str and (not page_str.isdigit() or int(page_str) < 1):
                 yield event.plain_result("页码必须是正整数")
                 return
-            page = int(page_str)
+            if page_str:
+                page = int(page_str)
 
         per_page = 10
         users, total = self.db.get_ranking(

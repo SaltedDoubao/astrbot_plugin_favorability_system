@@ -297,7 +297,7 @@ class FavorabilityDB:
              AND u.user_id = n.user_id
              AND n.is_current = 1
             WHERE u.session_type = ? AND u.session_id = ?
-            ORDER BY u.level DESC
+            ORDER BY u.level DESC, u.user_id ASC
             LIMIT ? OFFSET ?
             """,
             (session_type, session_id, limit, offset),
