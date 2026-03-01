@@ -246,29 +246,43 @@ class FavorabilityPlugin(Star):
         ts = now_ts or int(time.time())
         return time.strftime("%Y-%m-%d", time.localtime(ts))
 
+    def _normalize_nickname(self, nickname: str, user_id: str) -> Optional[str]:
+        normalized = str(nickname or "").strip()
+        if not normalized:
+            return None
+        if normalized == user_id:
+            return None
+        return normalized
+
     def _coerce_user(
         self,
         session_type: str,
         session_id: str,
         user_id: str,
         nickname: str,
+        update_nickname: bool = True,
     ) -> tuple[Optional[User], bool]:
         if not self.db:
             return None, False
 
         user = self.db.get_user(session_type, session_id, user_id)
         registered = False
-        normalized_nickname = str(nickname or "").strip() or user_id
+        normalized_nickname = self._normalize_nickname(nickname, user_id)
 
         if not user:
             if not self.db.add_user(session_type, session_id, user_id, self._clamp_level(0)):
                 return None, False
-            self.db.upsert_current_nickname(
-                session_type, session_id, user_id, normalized_nickname
-            )
+            if normalized_nickname:
+                self.db.upsert_current_nickname(
+                    session_type, session_id, user_id, normalized_nickname
+                )
             user = self.db.get_user(session_type, session_id, user_id)
             registered = True
-        elif normalized_nickname and user.current_nickname != normalized_nickname:
+        elif (
+            update_nickname
+            and normalized_nickname
+            and user.current_nickname != normalized_nickname
+        ):
             self.db.upsert_current_nickname(
                 session_type, session_id, user_id, normalized_nickname
             )
@@ -534,7 +548,8 @@ class FavorabilityPlugin(Star):
             session_type,
             session_id,
             normalized_id,
-            sender_name or normalized_id,
+            "",
+            update_nickname=False,
         )
         if not user:
             return "无法初始化用户资料"
@@ -927,16 +942,18 @@ class FavorabilityPlugin(Star):
             return
 
         initial_level = self._clamp_level(0)
-        nickname = sender_name or sender_id
+        nickname = self._normalize_nickname(sender_name, sender_id)
+        display_nickname = nickname or sender_id
 
         if not self.db.add_user(session_type, session_id, sender_id, initial_level):
             yield event.plain_result("注册失败，请稍后重试。")
             return
 
-        self.db.upsert_current_nickname(session_type, session_id, sender_id, nickname)
+        if nickname:
+            self.db.upsert_current_nickname(session_type, session_id, sender_id, nickname)
 
         yield event.plain_result(
-            f"注册成功！\n昵称: {nickname}\n好感度: {initial_level}"
+            f"注册成功！\n昵称: {display_nickname}\n好感度: {initial_level}"
         )
 
     @filter.command("fav-rl")
