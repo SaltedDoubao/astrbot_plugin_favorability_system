@@ -9,10 +9,25 @@
     "description": "好感度等级的最大值（当前版本固定为 100）",
     "default": 100
   },
+  "decay_enabled": {
+    "type": "bool",
+    "description": "是否启用长期不互动时的惰性衰减（默认关闭）",
+    "default": false
+  },
+  "idle_days_threshold": {
+    "type": "int",
+    "description": "开启衰减后，超过该天数才开始按天回归中立",
+    "default": 14
+  },
+  "decay_per_day": {
+    "type": "int",
+    "description": "开启衰减后，每超出一天向 0 回归的点数",
+    "default": 1
+  },
   "tiers": {
     "type": "string",
     "description": "JSON 格式层级定义数组，必须连续覆盖 -100~100，每项包含 name/min/max/effect",
-    "hint": "示例: [{\"name\":\"中立\",\"min\":-20,\"max\":20,\"effect\":\"保持客观\"}]",
-    "default": "[{\"name\":\"敌对\",\"min\":-100,\"max\":-61,\"effect\":\"强烈反感，尽量回避互动\"},{\"name\":\"冷淡\",\"min\":-60,\"max\":-21,\"effect\":\"态度疏离，交流意愿较低\"},{\"name\":\"中立\",\"min\":-20,\"max\":20,\"effect\":\"保持客观，正常沟通\"},{\"name\":\"友好\",\"min\":21,\"max\":60,\"effect\":\"态度积极，愿意配合\"},{\"name\":\"亲密\",\"min\":61,\"max\":100,\"effect\":\"高度信任，互动自然亲近\"}]"
+    "hint": "示例: [{\"name\":\"中立\",\"min\":-10,\"max\":9,\"effect\":\"保持客观\"}]",
+    "default": "[{\"name\":\"敌对\",\"min\":-100,\"max\":-51,\"effect\":\"强烈反感，回复克制并保持距离\"},{\"name\":\"冷淡\",\"min\":-50,\"max\":-11,\"effect\":\"态度保守，偏简短回应\"},{\"name\":\"中立\",\"min\":-10,\"max\":9,\"effect\":\"正常沟通，理性且不过分亲近\"},{\"name\":\"友好\",\"min\":10,\"max\":39,\"effect\":\"积极配合，语气更温和并适度主动\"},{\"name\":\"亲密\",\"min\":40,\"max\":100,\"effect\":\"信任度高，互动自然亲近并更愿意延展话题\"}]"
   }
 }
