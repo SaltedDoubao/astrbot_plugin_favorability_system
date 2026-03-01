@@ -1,6 +1,6 @@
 ---
 name: skill_favorability
-description: 好感度系统技能包。每轮对话自动查询/注册用户好感度，根据层级效果调整回复风格，并在回复后评估情感变化。
+description: 好感度系统技能包。每轮对话自动拉取用户画像并在回复后进行互动评估，适配群聊日常高频交流。
 ---
 
 # 好感度技能
@@ -9,8 +9,8 @@ description: 好感度系统技能包。每轮对话自动查询/注册用户好
 
 ```
 每轮对话
-  ├─ 回复前 ──▶ 02_aware_response（自动注册 + 查询层级效果）
-  └─ 回复后 ──▶ 03_evaluate（评估情感变化）
+  ├─ 回复前 ──▶ 02_aware_response（fav_profile 拉取风格画像）
+  └─ 回复后 ──▶ 03_evaluate（fav_assess 评估互动并更新）
 ```
 
 ## Skill 列表
@@ -28,6 +28,6 @@ description: 好感度系统技能包。每轮对话自动查询/注册用户好
 
 ### 标准参数模板
 
-- `fav_ensure`: `{"user_id":"<sender_id>","nickname":"<display_name>"}`
-- `fav_delta`: `{"user_id":"<sender_id>","delta":<integer>}`
+- `fav_profile`: `{"user_id":"<sender_id>","nickname":"<display_name>"}`
+- `fav_assess`: `{"user_id":"<sender_id>","interaction_type":"<enum>","intensity":<1|2|3>,"evidence":"<brief_reason>"}`
 - `fav_add_nickname`: `{"user_id":"<sender_id>","nickname":"<new_nickname>"}`
