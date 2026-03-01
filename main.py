@@ -1,23 +1,45 @@
 import json
 import math
 import os
+import time
 from typing import Optional
 
 from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from .db import FavorabilityDB, NicknameAmbiguousError, SchemaMismatchError
+from .db import FavorabilityDB, NicknameAmbiguousError, SchemaMismatchError, User
 
 REQUIRED_MIN_LEVEL = -100
 REQUIRED_MAX_LEVEL = 100
+
+INTERACTION_BASE_DELTA = {
+    "small_talk": 2,
+    "thanks": 4,
+    "helpful_dialogue": 5,
+    "deep_talk": 6,
+    "celebration": 9,
+    "cold": -2,
+    "rude": -6,
+    "abuse": -10,
+}
+
+INTENSITY_MULTIPLIER = {1: 0.8, 2: 1.0, 3: 1.25}
+POSITIVE_BIAS_FACTOR = 1.15
+ANTI_SPAM_WINDOW_SEC = 120
+TEN_MIN_WINDOW_SEC = 600
+TEN_MIN_POSITIVE_CAP = 20
+DAILY_POSITIVE_CAP = 50
+PER_ROUND_MIN_DELTA = -12
+PER_ROUND_MAX_DELTA = 12
+MAX_EVIDENCE_LENGTH = 120
 
 
 @register(
     "astrbot_plugin_favorability_system",
     "SaltedDoubao",
     "角色扮演好感度记录系统，提供好感度的增删查改工具供 LLM 调用",
-    "0.1.0",
+    "0.2.0",
 )
 class FavorabilityPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -27,6 +49,9 @@ class FavorabilityPlugin(Star):
         self.min_level: int = 0
         self.max_level: int = 0
         self.tiers: list[dict] = []
+        self.decay_enabled: bool = False
+        self.idle_days_threshold: int = 14
+        self.decay_per_day: int = 1
 
     async def initialize(self):
         try:
@@ -36,6 +61,14 @@ class FavorabilityPlugin(Star):
 
             tiers = self._parse_required_tiers("tiers")
             self.tiers = self._validate_and_normalize_tiers(tiers)
+
+            self.decay_enabled = self._parse_optional_bool("decay_enabled", False)
+            self.idle_days_threshold = self._parse_optional_int(
+                "idle_days_threshold", 14, min_value=0
+            )
+            self.decay_per_day = self._parse_optional_int(
+                "decay_per_day", 1, min_value=1
+            )
 
             try:
                 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -61,6 +94,41 @@ class FavorabilityPlugin(Star):
             return int(raw)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"配置项 {key} 不是合法整数: {raw}") from exc
+
+    def _parse_optional_int(self, key: str, default: int, min_value: int = 0) -> int:
+        if key not in self._config:
+            return default
+        raw = self._config.get(key)
+        if isinstance(raw, dict) and "value" in raw:
+            raw = raw["value"]
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"配置项 {key} 不是合法整数: {raw}") from exc
+        if value < min_value:
+            raise ValueError(f"配置项 {key} 不能小于 {min_value}")
+        return value
+
+    def _parse_optional_bool(self, key: str, default: bool) -> bool:
+        if key not in self._config:
+            return default
+
+        raw = self._config.get(key)
+        if isinstance(raw, dict) and "value" in raw:
+            raw = raw["value"]
+
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, int):
+            return raw != 0
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+
+        raise ValueError(f"配置项 {key} 不是合法布尔值: {raw}")
 
     def _parse_required_tiers(self, key: str) -> list[dict]:
         if key not in self._config:
@@ -174,6 +242,150 @@ class FavorabilityPlugin(Star):
     def _format_session(self, session_type: str, session_id: str) -> str:
         return f"{session_type}:{session_id}"
 
+    def _get_today_bucket(self, now_ts: Optional[int] = None) -> str:
+        ts = now_ts or int(time.time())
+        return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+    def _coerce_user(
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        nickname: str,
+    ) -> tuple[Optional[User], bool]:
+        if not self.db:
+            return None, False
+
+        user = self.db.get_user(session_type, session_id, user_id)
+        registered = False
+        normalized_nickname = str(nickname or "").strip() or user_id
+
+        if not user:
+            if not self.db.add_user(session_type, session_id, user_id, self._clamp_level(0)):
+                return None, False
+            self.db.upsert_current_nickname(
+                session_type, session_id, user_id, normalized_nickname
+            )
+            user = self.db.get_user(session_type, session_id, user_id)
+            registered = True
+        elif normalized_nickname and user.current_nickname != normalized_nickname:
+            self.db.upsert_current_nickname(
+                session_type, session_id, user_id, normalized_nickname
+            )
+            user = self.db.get_user(session_type, session_id, user_id)
+
+        return user, registered
+
+    def _refresh_daily_bucket(
+        self,
+        session_type: str,
+        session_id: str,
+        user: User,
+        now_ts: Optional[int] = None,
+    ) -> User:
+        if not self.db:
+            return user
+
+        today = self._get_today_bucket(now_ts)
+        if user.daily_bucket == today:
+            return user
+
+        self.db.update_level(
+            session_type,
+            session_id,
+            user.user_id,
+            user.level,
+            daily_pos_gain=0,
+            daily_neg_gain=0,
+            daily_bucket=today,
+        )
+        user.daily_pos_gain = 0
+        user.daily_neg_gain = 0
+        user.daily_bucket = today
+        return user
+
+    def _apply_decay_if_needed(
+        self,
+        session_type: str,
+        session_id: str,
+        user: User,
+        now_ts: Optional[int] = None,
+    ) -> User:
+        if not self.db:
+            return user
+        if not self.decay_enabled:
+            return user
+        if not user.last_interaction_at:
+            return user
+
+        now = now_ts or int(time.time())
+        idle_days = max(0, (now - user.last_interaction_at) // 86400)
+        if idle_days <= self.idle_days_threshold:
+            return user
+
+        decay_days = idle_days - self.idle_days_threshold
+        decay_amount = decay_days * self.decay_per_day
+
+        if user.level > 0:
+            new_level = max(0, user.level - decay_amount)
+        elif user.level < 0:
+            new_level = min(0, user.level + decay_amount)
+        else:
+            new_level = user.level
+
+        if new_level == user.level:
+            return user
+
+        settled_last_interaction = now - self.idle_days_threshold * 86400
+        self.db.update_level(
+            session_type,
+            session_id,
+            user.user_id,
+            new_level,
+            last_interaction_at=settled_last_interaction,
+        )
+        user.level = new_level
+        user.last_interaction_at = settled_last_interaction
+        return user
+
+    def _interpolate(
+        self,
+        value: int,
+        min_level: int,
+        max_level: int,
+        start: float,
+        end: float,
+    ) -> float:
+        if max_level <= min_level:
+            return start
+        ratio = (value - min_level) / float(max_level - min_level)
+        ratio = max(0.0, min(1.0, ratio))
+        return start + (end - start) * ratio
+
+    def _build_style_payload(self, level: int) -> tuple[float, dict]:
+        if level <= -51:
+            style_weight = self._interpolate(level, -100, -51, 0.32, 0.38)
+        elif level <= -11:
+            style_weight = self._interpolate(level, -50, -11, 0.38, 0.44)
+        elif level <= 9:
+            style_weight = self._interpolate(level, -10, 9, 0.44, 0.50)
+        elif level <= 39:
+            style_weight = self._interpolate(level, 10, 39, 0.60, 0.69)
+        else:
+            style_weight = self._interpolate(level, 40, 100, 0.70, 0.78)
+
+        warmth = int(max(0, min(100, round(50 + level * 0.45))))
+        initiative = int(max(0, min(100, round(45 + level * 0.40))))
+        boundary = int(max(0, min(100, round(55 - level * 0.35))))
+        playfulness = int(max(0, min(100, round(35 + level * 0.50))))
+
+        return round(style_weight, 2), {
+            "warmth": warmth,
+            "initiative": initiative,
+            "boundary": boundary,
+            "playfulness": playfulness,
+        }
+
     @llm_tool(name="fav_query")
     async def fav_query(self, event: AstrMessageEvent, identifier: str):
         """查询当前会话内用户的好感度等级和层级效果。identifier 可以是用户 ID 或当前昵称。
@@ -229,13 +441,13 @@ class FavorabilityPlugin(Star):
             f"当前层级: {tier_info}"
         )
 
-    @llm_tool(name="fav_ensure")
-    async def fav_ensure(self, event: AstrMessageEvent, user_id: str, nickname: str):
-        """查询当前会话内用户的好感度与层级效果；若用户不存在则自动注册。每轮对话开始时调用。
+    @llm_tool(name="fav_profile")
+    async def fav_profile(self, event: AstrMessageEvent, user_id: str, nickname: str):
+        """回复前拉取用户好感度画像，必要时自动注册用户。
 
         Args:
             user_id(string): 用户 ID
-            nickname(string): 用户当前昵称（仅在自动注册时使用）
+            nickname(string): 用户当前昵称
         """
         if not self.db:
             return "好感度系统未初始化"
@@ -249,32 +461,218 @@ class FavorabilityPlugin(Star):
         if not normalized_id:
             return "user_id 不能为空"
 
-        user = self.db.get_user(session_type, session_id, normalized_id)
-        registered = False
-
+        user, registered = self._coerce_user(
+            session_type,
+            session_id,
+            normalized_id,
+            str(nickname or "").strip() or normalized_id,
+        )
         if not user:
-            normalized_nickname = str(nickname or "").strip() or normalized_id
-            initial_level = self._clamp_level(0)
-            if not self.db.add_user(
-                session_type, session_id, normalized_id, initial_level
-            ):
-                return "自动注册失败"
-            self.db.upsert_current_nickname(
-                session_type, session_id, normalized_id, normalized_nickname
-            )
-            user = self.db.get_user(session_type, session_id, normalized_id)
-            if not user:
-                return "自动注册后查询失败"
-            registered = True
+            return "无法初始化用户画像"
+
+        now_ts = int(time.time())
+        user = self._refresh_daily_bucket(session_type, session_id, user, now_ts)
+        user = self._apply_decay_if_needed(session_type, session_id, user, now_ts)
 
         tier = self._get_tier(user.level)
-        tier_info = f"【{tier['name']}】{tier['effect']}" if tier else "未知层级"
+        tier_name = tier["name"] if tier else "未知"
+        effect_brief = tier["effect"] if tier else ""
+        style_weight, style_axes = self._build_style_payload(user.level)
 
-        msg = ""
-        if registered:
-            msg += "[新用户已注册]\n"
-        msg += f"好感度: {user.level}\n当前层级: {tier_info}"
-        return msg
+        payload = {
+            "level": user.level,
+            "tier": tier_name,
+            "style_weight": style_weight,
+            "style_axes": style_axes,
+            "effect_brief": effect_brief,
+            "registered": registered,
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    @llm_tool(name="fav_assess")
+    async def fav_assess(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        interaction_type: str,
+        intensity: int,
+        evidence: str = "",
+    ):
+        """回复后评估交互质量，应用反刷和限幅策略后更新好感度。
+
+        Args:
+            user_id(string): 用户 ID
+            interaction_type(string): 交互类型
+            intensity(number): 强度 1~3
+            evidence(string): 评分依据简述
+        """
+        if not self.db:
+            return "好感度系统未初始化"
+
+        try:
+            session_type, session_id, sender_name = self._resolve_session_context(event)
+        except ValueError as exc:
+            return f"会话上下文异常: {exc}"
+
+        normalized_id = str(user_id or "").strip()
+        if not normalized_id:
+            return "user_id 不能为空"
+
+        interaction_key = str(interaction_type or "").strip().lower()
+        if interaction_key not in INTERACTION_BASE_DELTA:
+            allow = ", ".join(INTERACTION_BASE_DELTA.keys())
+            return f"interaction_type 非法，允许值: {allow}"
+
+        try:
+            normalized_intensity = int(intensity)
+        except (TypeError, ValueError):
+            return f"intensity {intensity} 不是有效整数"
+        if normalized_intensity not in INTENSITY_MULTIPLIER:
+            return "intensity 必须是 1、2、3"
+
+        user, _ = self._coerce_user(
+            session_type,
+            session_id,
+            normalized_id,
+            sender_name or normalized_id,
+        )
+        if not user:
+            return "无法初始化用户资料"
+
+        now_ts = int(time.time())
+        user = self._refresh_daily_bucket(session_type, session_id, user, now_ts)
+        user = self._apply_decay_if_needed(session_type, session_id, user, now_ts)
+
+        old_level = user.level
+        base_delta = INTERACTION_BASE_DELTA[interaction_key]
+        intensity_mul = INTENSITY_MULTIPLIER[normalized_intensity]
+        raw_delta = round(base_delta * intensity_mul)
+
+        positive_bias = 1.0
+        if raw_delta > 0:
+            positive_bias = POSITIVE_BIAS_FACTOR
+            raw_delta = round(raw_delta * positive_bias)
+
+        anti_spam_mul = 1.0
+        if raw_delta > 0:
+            positive_count = self.db.count_positive_events_by_type_since(
+                session_type,
+                session_id,
+                normalized_id,
+                interaction_key,
+                now_ts - ANTI_SPAM_WINDOW_SEC,
+            )
+            occurrence = positive_count + 1
+            if occurrence == 1:
+                anti_spam_mul = 1.0
+            elif occurrence == 2:
+                anti_spam_mul = 0.75
+            elif occurrence == 3:
+                anti_spam_mul = 0.5
+            else:
+                anti_spam_mul = 0.3
+
+        final_delta = round(raw_delta * anti_spam_mul)
+
+        cap_clip = {
+            "per_round": False,
+            "ten_min_positive": False,
+            "daily_positive": False,
+            "global_level": False,
+        }
+
+        clipped = max(PER_ROUND_MIN_DELTA, min(PER_ROUND_MAX_DELTA, final_delta))
+        if clipped != final_delta:
+            cap_clip["per_round"] = True
+        final_delta = clipped
+
+        if final_delta > 0:
+            ten_min_gain = self.db.sum_positive_delta_since(
+                session_type,
+                session_id,
+                normalized_id,
+                now_ts - TEN_MIN_WINDOW_SEC,
+            )
+            remaining_10m = max(0, TEN_MIN_POSITIVE_CAP - ten_min_gain)
+            if final_delta > remaining_10m:
+                final_delta = remaining_10m
+                cap_clip["ten_min_positive"] = True
+
+            remaining_daily = max(0, DAILY_POSITIVE_CAP - user.daily_pos_gain)
+            if final_delta > remaining_daily:
+                final_delta = remaining_daily
+                cap_clip["daily_positive"] = True
+
+        proposed_level = user.level + final_delta
+        new_level = self._clamp_level(proposed_level)
+        if new_level != proposed_level:
+            cap_clip["global_level"] = True
+
+        effective_delta = new_level - user.level
+
+        daily_pos_gain = user.daily_pos_gain
+        daily_neg_gain = user.daily_neg_gain
+        if effective_delta > 0:
+            daily_pos_gain += effective_delta
+        elif effective_delta < 0:
+            daily_neg_gain += abs(effective_delta)
+
+        user.daily_bucket = user.daily_bucket or self._get_today_bucket(now_ts)
+        self.db.update_level(
+            session_type,
+            session_id,
+            normalized_id,
+            new_level,
+            last_interaction_at=now_ts,
+            daily_pos_gain=daily_pos_gain,
+            daily_neg_gain=daily_neg_gain,
+            daily_bucket=user.daily_bucket,
+        )
+
+        evidence_text = str(evidence or "").strip()[:MAX_EVIDENCE_LENGTH]
+        self.db.log_score_event(
+            session_type,
+            session_id,
+            normalized_id,
+            interaction_key,
+            normalized_intensity,
+            raw_delta,
+            effective_delta,
+            anti_spam_mul,
+            now_ts,
+            evidence_text,
+        )
+
+        tier_after = self._get_tier(new_level)
+        tier_name = tier_after["name"] if tier_after else "未知"
+
+        logger.info(
+            "[FavorabilityPlugin] assess"
+            f" session={self._format_session(session_type, session_id)}"
+            f" user={normalized_id}"
+            f" type={interaction_key}"
+            f" intensity={normalized_intensity}"
+            f" old={old_level} new={new_level}"
+            f" raw={raw_delta} final={effective_delta}"
+            f" anti_spam_mul={anti_spam_mul}"
+            f" cap={cap_clip}"
+            f" evidence={evidence_text}"
+        )
+
+        result = {
+            "old_level": old_level,
+            "new_level": new_level,
+            "raw_delta": raw_delta,
+            "final_delta": effective_delta,
+            "factors": {
+                "intensity_mul": intensity_mul,
+                "positive_bias": positive_bias,
+                "anti_spam_mul": anti_spam_mul,
+                "cap_clip": cap_clip,
+            },
+            "tier_after": tier_name,
+        }
+        return json.dumps(result, ensure_ascii=False)
 
     @llm_tool(name="fav_update")
     async def fav_update(self, event: AstrMessageEvent, user_id: str, level: int):
@@ -351,44 +749,6 @@ class FavorabilityPlugin(Star):
             f"已在会话 {self._format_session(session_type, session_id)} 注册用户"
             f"「{user_id}」，当前昵称「{normalized_nickname}」，初始好感度: {initial_level}"
         )
-
-    @llm_tool(name="fav_delta")
-    async def fav_delta(self, event: AstrMessageEvent, user_id: str, delta: int):
-        """对当前会话内用户的好感度施加相对变化量（正数增加，负数减少），无需先查询当前值。
-
-        Args:
-            user_id(string): 用户 ID
-            delta(number): 好感度变化量，正数增加，负数减少
-        """
-        if not self.db:
-            return "好感度系统未初始化"
-
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
-
-        try:
-            delta_value = int(delta)
-        except (TypeError, ValueError):
-            return f"delta {delta} 不是有效整数"
-
-        user = self.db.get_user(session_type, session_id, user_id)
-        if not user:
-            return (
-                f"当前会话（{self._format_session(session_type, session_id)}）中"
-                f"用户「{user_id}」不存在"
-            )
-
-        new_level = self._clamp_level(user.level + delta_value)
-        self.db.update_level(session_type, session_id, user_id, new_level)
-
-        tier = self._get_tier(new_level)
-        tier_info = f"【{tier['name']}】{tier['effect']}" if tier else ""
-        msg = f"「{user_id}」好感度 {user.level:+d} → {new_level}"
-        if tier_info:
-            msg += f"\n当前层级: {tier_info}"
-        return msg
 
     @llm_tool(name="fav_remove_user")
     async def fav_remove_user(self, event: AstrMessageEvent, user_id: str):
@@ -537,7 +897,7 @@ class FavorabilityPlugin(Star):
             yield event.plain_result("你还没有被记录在当前会话中哦。")
             return
 
-        nickname = user.current_nickname or "无"
+        nickname = user.current_nickname or sender_name or "无"
 
         yield event.plain_result(
             f"昵称: {nickname}（{sender_id}）\n好感度: {user.level}"

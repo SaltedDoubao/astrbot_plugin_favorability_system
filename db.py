@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaMismatchError(RuntimeError):
@@ -30,6 +30,10 @@ class User:
     level: int
     current_nickname: Optional[str] = None
     historical_nicknames: list[str] = field(default_factory=list)
+    last_interaction_at: Optional[int] = None
+    daily_pos_gain: int = 0
+    daily_neg_gain: int = 0
+    daily_bucket: Optional[str] = None
 
 
 class FavorabilityDB:
@@ -74,6 +78,10 @@ class FavorabilityDB:
         except (TypeError, ValueError) as exc:
             raise SchemaMismatchError("schema_version 非法，无法继续启动。") from exc
 
+        if version == 2:
+            self._migrate_v2_to_v3()
+            version = 3
+
         if version != SCHEMA_VERSION:
             raise SchemaMismatchError(
                 f"数据库 schema_version={version}，当前插件要求 {SCHEMA_VERSION}。请删除旧数据库后重建。"
@@ -94,6 +102,10 @@ class FavorabilityDB:
                 session_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 level INTEGER NOT NULL,
+                last_interaction_at INTEGER,
+                daily_pos_gain INTEGER NOT NULL DEFAULT 0,
+                daily_neg_gain INTEGER NOT NULL DEFAULT 0,
+                daily_bucket TEXT,
                 PRIMARY KEY (session_type, session_id, user_id)
             );
 
@@ -111,6 +123,26 @@ class FavorabilityDB:
 
             CREATE INDEX IF NOT EXISTS idx_nick_lookup
             ON nicknames(session_type, session_id, nickname, is_current);
+
+            CREATE TABLE IF NOT EXISTS score_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                interaction_type TEXT NOT NULL,
+                intensity INTEGER NOT NULL,
+                raw_delta INTEGER NOT NULL,
+                final_delta INTEGER NOT NULL,
+                anti_spam_mul REAL NOT NULL,
+                created_at INTEGER NOT NULL,
+                evidence TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_score_events_user_time
+            ON score_events(session_type, session_id, user_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_score_events_type_time
+            ON score_events(session_type, session_id, user_id, interaction_type, created_at);
             """
         )
         self.conn.execute(
@@ -119,8 +151,81 @@ class FavorabilityDB:
         )
         self.conn.commit()
 
+    def _migrate_v2_to_v3(self):
+        existing_tables = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        required_v2_tables = {"users", "nicknames"}
+        missing = required_v2_tables - existing_tables
+        if missing:
+            raise SchemaMismatchError(
+                f"v2 数据库缺少必要表: {', '.join(sorted(missing))}。无法迁移。"
+            )
+
+        try:
+            user_columns = self._get_columns("users")
+            if "last_interaction_at" not in user_columns:
+                self.conn.execute("ALTER TABLE users ADD COLUMN last_interaction_at INTEGER")
+            if "daily_pos_gain" not in user_columns:
+                self.conn.execute(
+                    "ALTER TABLE users ADD COLUMN daily_pos_gain INTEGER NOT NULL DEFAULT 0"
+                )
+            if "daily_neg_gain" not in user_columns:
+                self.conn.execute(
+                    "ALTER TABLE users ADD COLUMN daily_neg_gain INTEGER NOT NULL DEFAULT 0"
+                )
+            if "daily_bucket" not in user_columns:
+                self.conn.execute("ALTER TABLE users ADD COLUMN daily_bucket TEXT")
+
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS score_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_type TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    interaction_type TEXT NOT NULL,
+                    intensity INTEGER NOT NULL,
+                    raw_delta INTEGER NOT NULL,
+                    final_delta INTEGER NOT NULL,
+                    anti_spam_mul REAL NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    evidence TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_score_events_user_time
+                ON score_events(session_type, session_id, user_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_score_events_type_time
+                ON score_events(session_type, session_id, user_id, interaction_type, created_at);
+                """
+            )
+
+            today_bucket = time.strftime("%Y-%m-%d", time.localtime())
+            self.conn.execute(
+                """
+                UPDATE users
+                SET
+                    daily_pos_gain = COALESCE(daily_pos_gain, 0),
+                    daily_neg_gain = COALESCE(daily_neg_gain, 0),
+                    daily_bucket = COALESCE(daily_bucket, ?)
+                """,
+                (today_bucket,),
+            )
+
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '3')"
+            )
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            raise SchemaMismatchError(f"v2 -> v3 迁移失败: {exc}") from exc
+
     def _validate_schema(self):
-        required_tables = {"meta", "users", "nicknames"}
+        required_tables = {"meta", "users", "nicknames", "score_events"}
         existing_tables = {
             row[0]
             for row in self.conn.execute(
@@ -134,9 +239,18 @@ class FavorabilityDB:
             )
 
         users_columns = self._get_columns("users")
-        required_users_columns = {"session_type", "session_id", "user_id", "level"}
-        if users_columns != required_users_columns:
-            raise SchemaMismatchError("users 表结构不符合要求。请删除旧数据库后重建。")
+        required_users_columns = {
+            "session_type",
+            "session_id",
+            "user_id",
+            "level",
+            "last_interaction_at",
+            "daily_pos_gain",
+            "daily_neg_gain",
+            "daily_bucket",
+        }
+        if not required_users_columns.issubset(users_columns):
+            raise SchemaMismatchError("users 表结构不符合 v3 要求。请删除旧数据库后重建。")
 
         users_pk_columns = self._get_pk_columns("users")
         if users_pk_columns != ["session_type", "session_id", "user_id"]:
@@ -151,7 +265,7 @@ class FavorabilityDB:
             "is_current",
             "created_at",
         }
-        if nick_columns != required_nick_columns:
+        if not required_nick_columns.issubset(nick_columns):
             raise SchemaMismatchError(
                 "nicknames 表结构不符合要求。请删除旧数据库后重建。"
             )
@@ -171,6 +285,49 @@ class FavorabilityDB:
         ):
             raise SchemaMismatchError(
                 "nicknames 索引不符合要求。请删除旧数据库后重建。"
+            )
+
+        score_columns = self._get_columns("score_events")
+        required_score_columns = {
+            "id",
+            "session_type",
+            "session_id",
+            "user_id",
+            "interaction_type",
+            "intensity",
+            "raw_delta",
+            "final_delta",
+            "anti_spam_mul",
+            "created_at",
+            "evidence",
+        }
+        if not required_score_columns.issubset(score_columns):
+            raise SchemaMismatchError(
+                "score_events 表结构不符合要求。请删除旧数据库后重建。"
+            )
+
+        if not self._has_index(
+            "score_events",
+            "idx_score_events_user_time",
+            ["session_type", "session_id", "user_id", "created_at"],
+        ):
+            raise SchemaMismatchError(
+                "score_events 索引 idx_score_events_user_time 缺失或不匹配。"
+            )
+
+        if not self._has_index(
+            "score_events",
+            "idx_score_events_type_time",
+            [
+                "session_type",
+                "session_id",
+                "user_id",
+                "interaction_type",
+                "created_at",
+            ],
+        ):
+            raise SchemaMismatchError(
+                "score_events 索引 idx_score_events_type_time 缺失或不匹配。"
             )
 
     def _get_columns(self, table_name: str) -> set[str]:
@@ -220,15 +377,39 @@ class FavorabilityDB:
         session_id: str,
         user_id: str,
         level: int,
+        last_interaction_at: Optional[int] = None,
+        daily_pos_gain: int = 0,
+        daily_neg_gain: int = 0,
+        daily_bucket: Optional[str] = None,
     ) -> bool:
         """添加新用户，若已存在返回 False。"""
+        if daily_bucket is None:
+            daily_bucket = time.strftime("%Y-%m-%d", time.localtime())
         try:
             self.conn.execute(
                 """
-                INSERT INTO users (session_type, session_id, user_id, level)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO users (
+                    session_type,
+                    session_id,
+                    user_id,
+                    level,
+                    last_interaction_at,
+                    daily_pos_gain,
+                    daily_neg_gain,
+                    daily_bucket
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_type, session_id, user_id, level),
+                (
+                    session_type,
+                    session_id,
+                    user_id,
+                    level,
+                    last_interaction_at,
+                    daily_pos_gain,
+                    daily_neg_gain,
+                    daily_bucket,
+                ),
             )
             self.conn.commit()
             return True
@@ -253,7 +434,15 @@ class FavorabilityDB:
         """通过会话和用户 ID 查询用户。"""
         row = self.conn.execute(
             """
-            SELECT session_type, session_id, user_id, level
+            SELECT
+                session_type,
+                session_id,
+                user_id,
+                level,
+                last_interaction_at,
+                daily_pos_gain,
+                daily_neg_gain,
+                daily_bucket
             FROM users
             WHERE session_type = ? AND session_id = ? AND user_id = ?
             """,
@@ -272,6 +461,10 @@ class FavorabilityDB:
             historical_nicknames=self.get_historical_nicknames(
                 session_type, session_id, user_id
             ),
+            last_interaction_at=row[4],
+            daily_pos_gain=row[5] or 0,
+            daily_neg_gain=row[6] or 0,
+            daily_bucket=row[7],
         )
 
     def get_ranking(
@@ -345,16 +538,42 @@ class FavorabilityDB:
         return self.get_user(session_type, session_id, rows[0][0])
 
     def update_level(
-        self, session_type: str, session_id: str, user_id: str, level: int
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        level: int,
+        *,
+        last_interaction_at: Optional[int] = None,
+        daily_pos_gain: Optional[int] = None,
+        daily_neg_gain: Optional[int] = None,
+        daily_bucket: Optional[str] = None,
     ) -> bool:
-        """更新好感度等级。"""
+        """更新好感度等级，可选更新行为统计字段。"""
+        sets = ["level = ?"]
+        params: list[object] = [level]
+
+        if last_interaction_at is not None:
+            sets.append("last_interaction_at = ?")
+            params.append(last_interaction_at)
+        if daily_pos_gain is not None:
+            sets.append("daily_pos_gain = ?")
+            params.append(daily_pos_gain)
+        if daily_neg_gain is not None:
+            sets.append("daily_neg_gain = ?")
+            params.append(daily_neg_gain)
+        if daily_bucket is not None:
+            sets.append("daily_bucket = ?")
+            params.append(daily_bucket)
+
+        params.extend([session_type, session_id, user_id])
         cur = self.conn.execute(
-            """
+            f"""
             UPDATE users
-            SET level = ?
+            SET {', '.join(sets)}
             WHERE session_type = ? AND session_id = ? AND user_id = ?
             """,
-            (level, session_type, session_id, user_id),
+            tuple(params),
         )
         self.conn.commit()
         return cur.rowcount > 0
@@ -479,6 +698,94 @@ class FavorabilityDB:
         return self.upsert_current_nickname(
             session_type, session_id, user_id, fallback_nickname
         )
+
+    def log_score_event(
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        interaction_type: str,
+        intensity: int,
+        raw_delta: int,
+        final_delta: int,
+        anti_spam_mul: float,
+        created_at: int,
+        evidence: str,
+    ):
+        self.conn.execute(
+            """
+            INSERT INTO score_events (
+                session_type,
+                session_id,
+                user_id,
+                interaction_type,
+                intensity,
+                raw_delta,
+                final_delta,
+                anti_spam_mul,
+                created_at,
+                evidence
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_type,
+                session_id,
+                user_id,
+                interaction_type,
+                intensity,
+                raw_delta,
+                final_delta,
+                anti_spam_mul,
+                created_at,
+                evidence,
+            ),
+        )
+        self.conn.commit()
+
+    def count_positive_events_by_type_since(
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        interaction_type: str,
+        since_ts: int,
+    ) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM score_events
+            WHERE session_type = ?
+              AND session_id = ?
+              AND user_id = ?
+              AND interaction_type = ?
+              AND final_delta > 0
+              AND created_at >= ?
+            """,
+            (session_type, session_id, user_id, interaction_type, since_ts),
+        ).fetchone()
+        return int(row[0] if row and row[0] is not None else 0)
+
+    def sum_positive_delta_since(
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        since_ts: int,
+    ) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(SUM(final_delta), 0)
+            FROM score_events
+            WHERE session_type = ?
+              AND session_id = ?
+              AND user_id = ?
+              AND final_delta > 0
+              AND created_at >= ?
+            """,
+            (session_type, session_id, user_id, since_ts),
+        ).fetchone()
+        return int(row[0] if row and row[0] is not None else 0)
 
     def close(self):
         self.conn.close()
