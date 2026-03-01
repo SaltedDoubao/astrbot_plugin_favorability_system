@@ -1,7 +1,7 @@
 name: astrbot_plugin_favorability_system
-display_name: 简单的好感度系统
-desc: 角色扮演好感度记录系统，通过 LLM 工具函数管理用户好感度等级与昵称
-version: v1.0.0
+display_name: 群聊好感度系统
+desc: 面向群聊日常互动的好感度系统，支持画像驱动回复与评分管线
+version: v1.1.0
 author: SaltedDoubao
 repo: https://github.com/SaltedDoubao/astrbot_plugin_favorability_system
 support_platforms:
