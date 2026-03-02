@@ -114,9 +114,26 @@ class FavorabilityDBV3Tests(unittest.TestCase):
             count = db.count_positive_events_by_type_since(
                 "group", "100", "u1", "thanks", 1729999999
             )
+            negative_count = db.count_negative_events_by_type_since(
+                "group", "100", "u1", "rude", 1729999999
+            )
             total = db.sum_positive_delta_since("group", "100", "u1", 1729999999)
             self.assertEqual(count, 1)
+            self.assertEqual(negative_count, 1)
             self.assertEqual(total, 5)
+            db.close()
+
+    def test_score_events_schema_still_valid_after_ddl_dedup(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "favorability.db")
+            db = FavorabilityDB(db_path)
+            db._validate_schema()
+            version_row = db.conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            self.assertIsNotNone(version_row)
+            assert version_row is not None
+            self.assertEqual(int(version_row[0]), 3)
             db.close()
 
     def test_remove_user_clears_score_events(self):
@@ -139,6 +156,29 @@ class FavorabilityDBV3Tests(unittest.TestCase):
             self.assertTrue(db.remove_user("group", "100", "u1"))
             left_events = db.conn.execute("SELECT COUNT(*) FROM score_events").fetchone()[0]
             self.assertEqual(left_events, 0)
+            db.close()
+
+    def test_count_negative_events_by_type_since(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "favorability.db")
+            db = FavorabilityDB(db_path)
+            db.add_user("group", "100", "u1", 0)
+            db.log_score_event(
+                "group",
+                "100",
+                "u1",
+                "rude",
+                2,
+                -6,
+                -6,
+                1.0,
+                1730000020,
+                "无礼表达",
+            )
+            count = db.count_negative_events_by_type_since(
+                "group", "100", "u1", "rude", 1730000010
+            )
+            self.assertEqual(count, 1)
             db.close()
 
     def test_only_one_current_nickname_allowed(self):

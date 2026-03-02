@@ -30,6 +30,9 @@ def _install_astrbot_stubs(data_path: str | None = None):
         def error(self, *_args, **_kwargs):
             pass
 
+        def exception(self, *_args, **_kwargs):
+            pass
+
     def _identity_decorator(*_args, **_kwargs):
         def inner(obj):
             return obj
@@ -235,6 +238,77 @@ class FavorabilityV2FlowTests(unittest.TestCase):
         )
         self.assertEqual(cnt, 1)
 
+    def test_apply_assessment_rejects_unknown_interaction_type(self):
+        self.plugin.db.add_user("group", "100", "u-unknown", 0)
+        ok, result = self.plugin._apply_assessment_internal(
+            session_type="group",
+            session_id="100",
+            user_id="u-unknown",
+            interaction_type="unknown_type",
+            intensity=1,
+        )
+        self.assertFalse(ok)
+        assert isinstance(result, str)
+        self.assertIn("interaction_type 非法", result)
+
+    def test_negative_anti_spam_decay_applies(self):
+        self.plugin.db.add_user("group", "100", "u-neg", 0)
+        ok1, r1 = self.plugin._apply_assessment_internal(
+            session_type="group",
+            session_id="100",
+            user_id="u-neg",
+            interaction_type="rude",
+            intensity=2,
+            evidence="KW_RUDE",
+            source="auto_hook",
+        )
+        ok2, r2 = self.plugin._apply_assessment_internal(
+            session_type="group",
+            session_id="100",
+            user_id="u-neg",
+            interaction_type="rude",
+            intensity=2,
+            evidence="KW_RUDE",
+            source="auto_hook",
+        )
+        self.assertTrue(ok1)
+        self.assertTrue(ok2)
+        assert isinstance(r1, dict) and isinstance(r2, dict)
+        self.assertEqual(r1["factors"]["anti_spam_mul"], 1.0)
+        self.assertEqual(r2["factors"]["anti_spam_mul"], 0.75)
+        user = self.plugin.db.get_user("group", "100", "u-neg")
+        assert user is not None
+        self.assertEqual(user.level, -10)
+
+    def test_daily_negative_cap_clamps_delta(self):
+        today = self.plugin._get_today_bucket()
+        self.plugin.daily_negative_cap = 10
+        self.plugin.db.add_user(
+            "group",
+            "100",
+            "u-neg-cap",
+            0,
+            daily_pos_gain=0,
+            daily_neg_gain=9,
+            daily_bucket=today,
+        )
+        ok, result = self.plugin._apply_assessment_internal(
+            session_type="group",
+            session_id="100",
+            user_id="u-neg-cap",
+            interaction_type="rude",
+            intensity=2,
+            evidence="KW_RUDE",
+            source="auto_hook",
+        )
+        self.assertTrue(ok)
+        assert isinstance(result, dict)
+        self.assertEqual(result["final_delta"], -1)
+        self.assertTrue(result["factors"]["cap_clip"]["daily_negative"])
+        user = self.plugin.db.get_user("group", "100", "u-neg-cap")
+        assert user is not None
+        self.assertEqual(user.daily_neg_gain, 10)
+
     def test_apply_assessment_internal_is_transactional_under_concurrency(self):
         self.plugin.db.add_user("group", "100", "u1", 0)
 
@@ -283,6 +357,16 @@ class FavorabilityV2FlowTests(unittest.TestCase):
         )
         self.assertEqual(cnt, 1)
 
+    def test_session_context_decorator_return_error_for_tool(self):
+        bad_event = _FakeEvent(sender_id="", group_id="100")
+        msg = asyncio.run(self.plugin.fav_query(bad_event, "u1"))
+        self.assertIn("会话上下文异常", msg)
+
+    def test_session_context_decorator_yield_error_for_command(self):
+        bad_event = _FakeEvent(sender_id="", group_id="100", message_str="fav-rl")
+        results = asyncio.run(self._collect(self.plugin.cmd_fav_ranking(bad_event)))
+        self.assertTrue(any("会话上下文异常" in msg for msg in results))
+
     def test_style_prompt_uses_effect_not_tier_name(self):
         self.plugin.tiers = [
             {"name": "A", "min": -100, "max": -1, "effect": "保持距离"},
@@ -293,6 +377,28 @@ class FavorabilityV2FlowTests(unittest.TestCase):
         req = _Req()
         asyncio.run(self.plugin.on_llm_request(event, req))
         self.assertIn("温和主动", req.system_prompt)
+
+    def test_keyword_profile_path_loads_external_keywords(self):
+        profile_path = os.path.join(self.td.name, "keywords.json")
+        with open(profile_path, "w", encoding="utf-8") as fp:
+            json.dump({"helpful_dialogue": ["火速救场"]}, fp, ensure_ascii=False)
+        self.plugin.keyword_profile_path = profile_path
+        self.plugin._reload_keyword_profile()
+        cls = self.plugin._classify_interaction_rule_v1("请你火速救场")
+        self.assertIsNotNone(cls)
+        assert cls is not None
+        self.assertEqual(cls["interaction_type"], "helpful_dialogue")
+
+    def test_keyword_profile_invalid_fallback_to_default(self):
+        bad_path = os.path.join(self.td.name, "bad_keywords.json")
+        with open(bad_path, "w", encoding="utf-8") as fp:
+            fp.write("{\"thanks\": 1}")
+        self.plugin.keyword_profile_path = bad_path
+        self.plugin._reload_keyword_profile()
+        cls = self.plugin._classify_interaction_rule_v1("谢谢你")
+        self.assertIsNotNone(cls)
+        assert cls is not None
+        self.assertEqual(cls["interaction_type"], "thanks")
 
     def test_tier_change_notice_injected_once(self):
         self.plugin.db.add_user("group", "100", "u2", 9)
