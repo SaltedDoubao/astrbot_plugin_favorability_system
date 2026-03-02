@@ -1,7 +1,7 @@
 name: astrbot_plugin_favorability_system
 display_name: 简单的好感度系统
 desc: 面向群聊日常互动的角色扮演好感度记录系统，结合人格提示词和skill产生作用
-version: v1.1.0
+version: v2.0.0
 author: SaltedDoubao
 repo: https://github.com/SaltedDoubao/astrbot_plugin_favorability_system
 support_platforms:

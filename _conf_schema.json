@@ -22,12 +22,42 @@
   "idle_days_threshold": {
     "type": "int",
     "description": "开启衰减后，超过该天数才开始按天回归中立",
-    "default": 14
+    "default": 7
   },
   "decay_per_day": {
     "type": "int",
     "description": "开启衰减后，每超出一天向 0 回归的点数",
     "default": 1
+  },
+  "auto_style_injection_enabled": {
+    "type": "bool",
+    "description": "是否在每轮 LLM 请求前自动注入一条短风格指令",
+    "default": true
+  },
+  "auto_assess_enabled": {
+    "type": "bool",
+    "description": "是否在每轮回复后自动执行规则评分并更新好感度",
+    "default": true
+  },
+  "auto_assess_skip_commands": {
+    "type": "bool",
+    "description": "自动评分时是否跳过插件命令消息",
+    "default": true
+  },
+  "negative_policy": {
+    "type": "string",
+    "description": "负向评分策略，支持 conservative/balanced/aggressive",
+    "default": "conservative"
+  },
+  "style_prompt_mode": {
+    "type": "string",
+    "description": "风格注入模式，当前仅支持 short_tier",
+    "default": "short_tier"
+  },
+  "rule_version": {
+    "type": "string",
+    "description": "自动评分规则版本，当前仅支持 v1",
+    "default": "v1"
   },
   "tiers": {
     "type": "string",
