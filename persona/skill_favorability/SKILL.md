@@ -1,33 +1,9 @@
 ---
 name: skill_favorability
-description: 好感度系统技能包。每轮对话自动拉取用户画像并在回复后进行互动评估，适配群聊日常高频交流。
+description: Deprecated in V2. 好感度主链路已改为插件自动注入风格与自动评分。
 ---
 
-# 好感度技能
+# Deprecated
 
-## 执行流程
-
-```
-每轮对话
-  ├─ 回复前 ──▶ 02_aware_response（fav_profile 拉取风格画像）
-  └─ 回复后 ──▶ 03_evaluate（fav_assess 评估互动并更新）
-```
-
-## Skill 列表
-
-| 文件 | 触发时机 |
-|------|---------|
-| [02_aware_response.md](02_aware_response.md) | 每轮生成回复前 |
-| [03_evaluate.md](03_evaluate.md) | 每轮回复生成后 |
-
-## 工具参数契约（严格）
-
-- 所有工具调用必须使用命名参数对象，不使用位置参数写法。
-- 参数键名必须与工具 schema 完全一致，不得增加任何额外字段。
-- 禁止传递占位字段（如 `_`）。
-
-### 标准参数模板
-
-- `fav_profile`: `{"user_id":"<sender_id>","nickname":"<display_name>"}`
-- `fav_assess`: `{"user_id":"<sender_id>","interaction_type":"<enum>","intensity":<1|2|3>,"evidence":"<brief_reason>"}`
-- `fav_add_nickname`: `{"user_id":"<sender_id>","nickname":"<new_nickname>"}`
+V2 起不建议继续加载本 Skill。  
+主流程无需 `fav_profile` / `fav_assess` 工具调用，已由插件内部钩子接管。
