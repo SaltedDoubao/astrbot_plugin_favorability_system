@@ -24,4 +24,10 @@
 | `fav_remove_user(user_id)` | 删除用户 |
 | `fav_add_nickname(user_id, nickname)` | 更新当前昵称 |
 | `fav_remove_nickname(user_id, nickname)` | 删除当前昵称 |
+| `fav_reset(user_id)` | 管理员重置指定用户好感度与当日统计 |
+| `fav_reset_all()` | 管理员重置当前会话全部用户 |
+| `fav_export(format, scope)` | 管理员导出会话/全局数据文件 |
+| `fav_stats(scope)` | 管理员查看会话/全局统计 |
 | `fav_get_effect(level)` | 查询指定等级层级效果 |
+
+- `fav_update`、`fav_add_user`、`fav_remove_user`、`fav_add_nickname`、`fav_remove_nickname`、`fav_reset`、`fav_reset_all`、`fav_export`、`fav_stats` 仅管理员可调用。

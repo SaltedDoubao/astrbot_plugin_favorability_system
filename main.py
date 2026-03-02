@@ -1,8 +1,11 @@
+import csv
+import io
 import json
 import math
 import os
 import re
 import time
+import zipfile
 from typing import Any, Optional
 
 from astrbot.api import llm_tool, logger
@@ -104,7 +107,15 @@ SMALL_TALK_KEYWORDS = {
     "hello",
     "hi",
 }
-COMMAND_ALIASES = {"fav-init", "fav-rl", "好感度查询"}
+COMMAND_ALIASES = {
+    "fav-init",
+    "fav-rl",
+    "好感度查询",
+    "fav-reset",
+    "fav-reset-all",
+    "fav-export",
+    "fav-stats",
+}
 
 
 @register(
@@ -131,8 +142,10 @@ class FavorabilityPlugin(Star):
         self.negative_policy: str = "conservative"
         self.style_prompt_mode: str = "short_tier"
         self.rule_version: str = "v1"
+        self.data_dir: str = ""
         self._pending_assessment: dict[str, dict[str, Any]] = {}
         self._recent_assessed_keys: dict[str, int] = {}
+        self._pending_tier_notice: dict[str, dict[str, Any]] = {}
 
     async def initialize(self):
         try:
@@ -198,6 +211,7 @@ class FavorabilityPlugin(Star):
                     "astrbot_plugin_favorability_system",
                 )
 
+            self.data_dir = data_dir
             db_path = os.path.join(data_dir, "favorability.db")
             self.db = FavorabilityDB(db_path)
             logger.info(f"[FavorabilityPlugin] 数据库已初始化: {db_path}")
@@ -394,6 +408,136 @@ class FavorabilityPlugin(Star):
 
     def _format_session(self, session_type: str, session_id: str) -> str:
         return f"{session_type}:{session_id}"
+
+    def _build_user_scope_key(
+        self, session_type: str, session_id: str, user_id: str
+    ) -> str:
+        return f"{session_type}:{session_id}:{user_id}"
+
+    def _is_admin_event(self, event: AstrMessageEvent) -> bool:
+        checker = getattr(event, "is_admin", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                pass
+
+        role = str(getattr(event, "role", "") or "").strip().lower()
+        return role in {"admin", "owner", "super_admin"}
+
+    def _admin_only_message(self) -> str:
+        return "权限不足：仅管理员可执行此操作。"
+
+    def _stable_status_hint(self, user: User) -> Optional[str]:
+        hints: list[str] = []
+        if user.daily_pos_gain >= DAILY_POSITIVE_CAP:
+            hints.append("今日正向增益已达上限")
+        if user.level in {self.min_level, self.max_level}:
+            hints.append("当前好感度已触达边界")
+        if not hints:
+            return None
+        return "；".join(hints)
+
+    def _build_tier_change_notice(
+        self, session_type: str, session_id: str, user_id: str, now_ts: int
+    ) -> Optional[str]:
+        self._cleanup_cache(self._pending_tier_notice, now_ts)
+        key = self._build_user_scope_key(session_type, session_id, user_id)
+        payload = self._pending_tier_notice.pop(key, None)
+        if not payload:
+            return None
+        from_tier = str(payload.get("from_tier", "未知"))
+        to_tier = str(payload.get("to_tier", "未知"))
+        return f"状态变化提示：该用户好感层级已从「{from_tier}」变为「{to_tier}」，请自然调整语气。"
+
+    def _normalize_export_format(self, raw: str) -> str:
+        value = str(raw or "").strip().lower() or "json"
+        if value not in {"json", "csv"}:
+            raise ValueError("导出格式仅支持 json 或 csv")
+        return value
+
+    def _normalize_export_scope(self, raw: str) -> str:
+        value = str(raw or "").strip().lower() or "session"
+        if value not in {"session", "global"}:
+            raise ValueError("scope 仅支持 session 或 global")
+        return value
+
+    def _get_effective_data_dir(self) -> str:
+        if self.data_dir:
+            return self.data_dir
+        if self.db:
+            row = self.db.conn.execute("PRAGMA database_list").fetchone()
+            if row and len(row) >= 3 and row[2]:
+                return os.path.dirname(str(row[2]))
+        return os.path.join(
+            os.path.dirname(__file__),
+            "data",
+            "plugin_data",
+            "astrbot_plugin_favorability_system",
+        )
+
+    def _write_json_export(
+        self, payload: dict[str, Any], export_path: str, session_label: str
+    ) -> str:
+        with open(export_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, indent=2)
+        return (
+            f"导出成功（JSON）\n"
+            f"范围: {session_label}\n"
+            f"users={len(payload['users'])} nicknames={len(payload['nicknames'])} events={len(payload['score_events'])}\n"
+            f"文件: {export_path}"
+        )
+
+    def _write_csv_export_zip(
+        self, payload: dict[str, Any], export_path: str, session_label: str
+    ) -> str:
+        table_headers = {
+            "users": [
+                "session_type",
+                "session_id",
+                "user_id",
+                "level",
+                "last_interaction_at",
+                "daily_pos_gain",
+                "daily_neg_gain",
+                "daily_bucket",
+            ],
+            "nicknames": [
+                "session_type",
+                "session_id",
+                "user_id",
+                "nickname",
+                "is_current",
+                "created_at",
+            ],
+            "score_events": [
+                "id",
+                "session_type",
+                "session_id",
+                "user_id",
+                "interaction_type",
+                "intensity",
+                "raw_delta",
+                "final_delta",
+                "anti_spam_mul",
+                "created_at",
+                "evidence",
+            ],
+        }
+        with zipfile.ZipFile(export_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for table_name, headers in table_headers.items():
+                buffer = io.StringIO()
+                writer = csv.DictWriter(buffer, fieldnames=headers)
+                writer.writeheader()
+                for row in payload[table_name]:
+                    writer.writerow({header: row.get(header) for header in headers})
+                zf.writestr(f"{table_name}.csv", buffer.getvalue())
+        return (
+            f"导出成功（CSV ZIP）\n"
+            f"范围: {session_label}\n"
+            f"users={len(payload['users'])} nicknames={len(payload['nicknames'])} events={len(payload['score_events'])}\n"
+            f"文件: {export_path}"
+        )
 
     def _get_today_bucket(self, now_ts: Optional[int] = None) -> str:
         ts = now_ts or int(time.time())
@@ -711,15 +855,11 @@ class FavorabilityPlugin(Star):
 
     def _build_short_style_prompt(self, level: int) -> str:
         tier = self._get_tier(level)
-        tier_name = tier["name"] if tier else "中立"
-        mapping = {
-            "敌对": "克制简洁，保持边界，避免亲昵。",
-            "冷淡": "理性简洁，不主动延展。",
-            "中立": "自然客观，礼貌回应。",
-            "友好": "温和积极，可适度追问。",
-            "亲密": "有温度且主动，保持分寸。",
-        }
-        style_hint = mapping.get(tier_name, "自然客观，礼貌回应。")
+        style_hint = (
+            str(tier["effect"]).strip() if tier and str(tier.get("effect", "")).strip() else ""
+        )
+        if not style_hint:
+            style_hint = "自然客观，礼貌回应。"
         return f"当前用户交互风格：{style_hint}"
 
     def _apply_assessment_internal(
@@ -774,6 +914,8 @@ class FavorabilityPlugin(Star):
                 )
 
                 old_level = user.level
+                tier_before = self._get_tier(old_level)
+                tier_before_name = tier_before["name"] if tier_before else "未知"
                 base_delta = INTERACTION_BASE_DELTA[interaction_key]
                 intensity_mul = INTENSITY_MULTIPLIER[normalized_intensity]
                 raw_delta = round(base_delta * intensity_mul)
@@ -838,6 +980,8 @@ class FavorabilityPlugin(Star):
                     cap_clip["global_level"] = True
 
                 effective_delta = new_level - user.level
+                tier_after = self._get_tier(new_level)
+                tier_after_name = tier_after["name"] if tier_after else "未知"
                 daily_pos_gain = user.daily_pos_gain
                 daily_neg_gain = user.daily_neg_gain
                 if effective_delta > 0:
@@ -876,8 +1020,15 @@ class FavorabilityPlugin(Star):
             logger.error(f"[FavorabilityPlugin] 评分事务失败: {exc}")
             return False, "评分写入失败，请稍后重试"
 
-        tier_after = self._get_tier(new_level)
-        tier_name = tier_after["name"] if tier_after else "未知"
+        if tier_before_name != tier_after_name:
+            self._pending_tier_notice[
+                self._build_user_scope_key(session_type, session_id, normalized_id)
+            ] = {
+                "created_at": now_ts,
+                "from_tier": tier_before_name,
+                "to_tier": tier_after_name,
+            }
+
         result = {
             "old_level": old_level,
             "new_level": new_level,
@@ -889,7 +1040,9 @@ class FavorabilityPlugin(Star):
                 "anti_spam_mul": anti_spam_mul,
                 "cap_clip": cap_clip,
             },
-            "tier_after": tier_name,
+            "tier_before": tier_before_name,
+            "tier_after": tier_after_name,
+            "tier_changed": tier_before_name != tier_after_name,
         }
 
         logger.info(
@@ -927,13 +1080,22 @@ class FavorabilityPlugin(Star):
         now_ts = int(time.time())
         user = self._refresh_daily_bucket(session_type, session_id, user, now_ts)
         user = self._apply_decay_if_needed(session_type, session_id, user, now_ts)
-
-        prompt_line = self._build_short_style_prompt(user.level)
         if self.style_prompt_mode != "short_tier":
             return
 
+        prompt_lines = [self._build_short_style_prompt(user.level)]
+        tier_notice = self._build_tier_change_notice(
+            session_type, session_id, sender_id, now_ts
+        )
+        if tier_notice:
+            prompt_lines.append(tier_notice)
+        stable_hint = self._stable_status_hint(user)
+        if stable_hint:
+            prompt_lines.append(f"状态提示：{stable_hint}。请保持自然与分寸。")
+
         current_prompt = str(getattr(req, "system_prompt", "") or "")
-        setattr(req, "system_prompt", f"{current_prompt}\n{prompt_line}".strip())
+        setattr(req, "system_prompt", f"{current_prompt}\n" + "\n".join(prompt_lines))
+        setattr(req, "system_prompt", str(getattr(req, "system_prompt", "")).strip())
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp):
@@ -1021,6 +1183,65 @@ class FavorabilityPlugin(Star):
                 f" user={sender_id}"
             )
 
+    def _export_data(
+        self,
+        *,
+        fmt: str,
+        scope: str,
+        session_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
+        if not self.db:
+            return "好感度系统未初始化"
+
+        payload = self.db.fetch_export_rows(
+            scope, session_type=session_type, session_id=session_id
+        )
+        now_ts = int(time.time())
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now_ts))
+        export_dir = os.path.join(self._get_effective_data_dir(), "exports")
+        os.makedirs(export_dir, exist_ok=True)
+        session_label = (
+            "global"
+            if scope == "global"
+            else self._format_session(str(session_type), str(session_id))
+        )
+        safe_label = session_label.replace(":", "_")
+        if fmt == "json":
+            export_path = os.path.join(export_dir, f"fav_export_{safe_label}_{timestamp}.json")
+            payload_with_meta = {
+                "scope": scope,
+                "session": session_label,
+                "exported_at": now_ts,
+                **payload,
+            }
+            return self._write_json_export(payload_with_meta, export_path, session_label)
+        export_path = os.path.join(export_dir, f"fav_export_{safe_label}_{timestamp}.zip")
+        return self._write_csv_export_zip(payload, export_path, session_label)
+
+    def _format_stats_message(
+        self,
+        *,
+        stats: dict[str, Any],
+        scope: str,
+        session_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
+        scope_label = (
+            "全局"
+            if scope == "global"
+            else f"会话 {self._format_session(str(session_type), str(session_id))}"
+        )
+        return (
+            f"统计范围: {scope_label}\n"
+            f"用户数: {stats['user_count']}\n"
+            f"平均好感度: {stats['avg_level']}\n"
+            f"最高/最低好感度: {stats['max_level']} / {stats['min_level']}\n"
+            f"今日正向累计: {stats['daily_pos_total']}\n"
+            f"今日负向累计: {stats['daily_neg_total']}\n"
+            f"评分事件总数: {stats['score_event_count']}"
+        )
+
     @llm_tool(name="fav_query")
     async def fav_query(self, event: AstrMessageEvent, identifier: str):
         """查询当前会话内用户的好感度等级和层级效果。identifier 可以是用户 ID 或当前昵称。
@@ -1086,6 +1307,8 @@ class FavorabilityPlugin(Star):
         """
         if not self.db:
             return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
 
         try:
             session_type, session_id, _ = self._resolve_session_context(event)
@@ -1126,6 +1349,8 @@ class FavorabilityPlugin(Star):
         """
         if not self.db:
             return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
 
         try:
             session_type, session_id, _ = self._resolve_session_context(event)
@@ -1161,6 +1386,8 @@ class FavorabilityPlugin(Star):
         """
         if not self.db:
             return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
 
         try:
             session_type, session_id, _ = self._resolve_session_context(event)
@@ -1190,6 +1417,8 @@ class FavorabilityPlugin(Star):
         """
         if not self.db:
             return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
 
         try:
             session_type, session_id, _ = self._resolve_session_context(event)
@@ -1236,6 +1465,8 @@ class FavorabilityPlugin(Star):
         """
         if not self.db:
             return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
 
         try:
             session_type, session_id, _ = self._resolve_session_context(event)
@@ -1276,6 +1507,123 @@ class FavorabilityPlugin(Star):
             return f"等级 {normalized_level} 不在任何已定义的层级范围内"
         return f"等级 {normalized_level} 对应层级【{tier['name']}】：{tier['effect']}"
 
+    @llm_tool(name="fav_reset")
+    async def fav_reset(self, event: AstrMessageEvent, user_id: str):
+        """管理员重置当前会话内指定用户的好感度与日统计。"""
+        if not self.db:
+            return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            return f"会话上下文异常: {exc}"
+        target_user = str(user_id or "").strip()
+        if not target_user:
+            return "user_id 不能为空"
+        now_ts = int(time.time())
+        initial_level = self._get_initial_level_for_new_user()
+        ok = self.db.reset_user(
+            session_type,
+            session_id,
+            target_user,
+            initial_level,
+            last_interaction_at=now_ts,
+            daily_bucket=self._get_today_bucket(now_ts),
+        )
+        if not ok:
+            return (
+                f"当前会话（{self._format_session(session_type, session_id)}）中"
+                f"用户「{target_user}」不存在"
+            )
+        return (
+            f"已重置会话 {self._format_session(session_type, session_id)} 中"
+            f"用户「{target_user}」的好感度为 {initial_level}"
+        )
+
+    @llm_tool(name="fav_reset_all")
+    async def fav_reset_all(self, event: AstrMessageEvent):
+        """管理员重置当前会话全部用户的好感度与日统计。"""
+        if not self.db:
+            return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            return f"会话上下文异常: {exc}"
+        now_ts = int(time.time())
+        initial_level = self._get_initial_level_for_new_user()
+        count = self.db.reset_session_users(
+            session_type,
+            session_id,
+            initial_level,
+            last_interaction_at=now_ts,
+            daily_bucket=self._get_today_bucket(now_ts),
+        )
+        return (
+            f"已重置会话 {self._format_session(session_type, session_id)} 的 {count} 名用户，"
+            f"好感度统一为 {initial_level}"
+        )
+
+    @llm_tool(name="fav_export")
+    async def fav_export(
+        self,
+        event: AstrMessageEvent,
+        format: str = "json",
+        scope: str = "session",
+    ):
+        """管理员导出当前会话或全局数据到文件。"""
+        if not self.db:
+            return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
+        try:
+            normalized_format = self._normalize_export_format(format)
+            normalized_scope = self._normalize_export_scope(scope)
+        except ValueError as exc:
+            return str(exc)
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            return f"会话上下文异常: {exc}"
+        if normalized_scope == "global":
+            return self._export_data(fmt=normalized_format, scope=normalized_scope)
+        return self._export_data(
+            fmt=normalized_format,
+            scope=normalized_scope,
+            session_type=session_type,
+            session_id=session_id,
+        )
+
+    @llm_tool(name="fav_stats")
+    async def fav_stats(self, event: AstrMessageEvent, scope: str = "session"):
+        """管理员查看当前会话或全局统计。"""
+        if not self.db:
+            return "好感度系统未初始化"
+        if not self._is_admin_event(event):
+            return self._admin_only_message()
+        try:
+            normalized_scope = self._normalize_export_scope(scope)
+        except ValueError as exc:
+            return str(exc)
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            return f"会话上下文异常: {exc}"
+        if normalized_scope == "global":
+            stats = self.db.get_stats(normalized_scope)
+            return self._format_stats_message(stats=stats, scope=normalized_scope)
+        stats = self.db.get_stats(
+            normalized_scope, session_type=session_type, session_id=session_id
+        )
+        return self._format_stats_message(
+            stats=stats,
+            scope=normalized_scope,
+            session_type=session_type,
+            session_id=session_id,
+        )
+
     @filter.command("好感度查询")
     async def cmd_fav_query(self, event: AstrMessageEvent):
         """查询自己在当前会话中的好感度等级和层级信息。"""
@@ -1299,11 +1647,23 @@ class FavorabilityPlugin(Star):
             yield event.plain_result("你还没有被记录在当前会话中哦。")
             return
 
+        now_ts = int(time.time())
+        user = self._refresh_daily_bucket(session_type, session_id, user, now_ts)
         nickname = user.current_nickname or sender_name or "无"
+        stable_hint = self._stable_status_hint(user)
+        lines = [
+            f"昵称: {nickname}（{sender_id}）",
+            f"好感度: {user.level}",
+            f"今日正向增益: {user.daily_pos_gain}/{DAILY_POSITIVE_CAP}",
+        ]
+        if user.daily_pos_gain >= DAILY_POSITIVE_CAP:
+            lines.append("提示：今日正向增益已达上限。")
+        if user.level in {self.min_level, self.max_level}:
+            lines.append("提示：当前好感度已触达边界，处于稳定状态。")
+        if stable_hint:
+            lines.append(f"状态：{stable_hint}")
 
-        yield event.plain_result(
-            f"昵称: {nickname}（{sender_id}）\n好感度: {user.level}"
-        )
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("fav-init")
     async def cmd_fav_init(self, event: AstrMessageEvent):
@@ -1341,6 +1701,156 @@ class FavorabilityPlugin(Star):
 
         yield event.plain_result(
             f"注册成功！\n昵称: {display_nickname}\n好感度: {initial_level}"
+        )
+
+    @filter.command("fav-reset")
+    async def cmd_fav_reset(self, event: AstrMessageEvent):
+        """重置自己在当前会话中的好感度与日统计。"""
+        if not self.db:
+            yield event.plain_result("好感度系统未初始化")
+            return
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            yield event.plain_result(f"会话上下文异常: {exc}")
+            return
+        sender_id = str(event.get_sender_id() or "").strip()
+        if not sender_id:
+            yield event.plain_result("无法获取你的用户 ID")
+            return
+        user = self.db.get_user(session_type, session_id, sender_id)
+        if not user:
+            yield event.plain_result("你还没有被记录在当前会话中哦。")
+            return
+        now_ts = int(time.time())
+        initial_level = self._get_initial_level_for_new_user()
+        self.db.reset_user(
+            session_type,
+            session_id,
+            sender_id,
+            initial_level,
+            last_interaction_at=now_ts,
+            daily_bucket=self._get_today_bucket(now_ts),
+        )
+        yield event.plain_result(f"已将你的好感度重置为 {initial_level}。")
+
+    @filter.command("fav-reset-all")
+    async def cmd_fav_reset_all(self, event: AstrMessageEvent):
+        """管理员重置当前会话全部用户。"""
+        if not self.db:
+            yield event.plain_result("好感度系统未初始化")
+            return
+        if not self._is_admin_event(event):
+            yield event.plain_result(self._admin_only_message())
+            return
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            yield event.plain_result(f"会话上下文异常: {exc}")
+            return
+        now_ts = int(time.time())
+        initial_level = self._get_initial_level_for_new_user()
+        count = self.db.reset_session_users(
+            session_type,
+            session_id,
+            initial_level,
+            last_interaction_at=now_ts,
+            daily_bucket=self._get_today_bucket(now_ts),
+        )
+        yield event.plain_result(f"已重置当前会话 {count} 名用户，好感度={initial_level}。")
+
+    @filter.command("fav-export")
+    async def cmd_fav_export(self, event: AstrMessageEvent):
+        """管理员导出数据到文件：fav-export [json|csv] [session|global]。"""
+        if not self.db:
+            yield event.plain_result("好感度系统未初始化")
+            return
+        if not self._is_admin_event(event):
+            yield event.plain_result(self._admin_only_message())
+            return
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            yield event.plain_result(f"会话上下文异常: {exc}")
+            return
+
+        raw = (event.message_str or "").strip()
+        parts = raw.split()
+        if parts and parts[0].lstrip("/!").lower() == "fav-export":
+            parts = parts[1:]
+        if len(parts) > 2:
+            yield event.plain_result("参数过多，用法：fav-export [json|csv] [session|global]")
+            return
+
+        export_format = "json"
+        export_scope = "session"
+        try:
+            if len(parts) >= 1:
+                token = parts[0].lower()
+                if token in {"json", "csv"}:
+                    export_format = self._normalize_export_format(token)
+                elif token in {"session", "global"}:
+                    export_scope = self._normalize_export_scope(token)
+                else:
+                    raise ValueError("第一个参数仅支持 json/csv 或 session/global")
+            if len(parts) == 2:
+                export_scope = self._normalize_export_scope(parts[1].lower())
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+
+        if export_scope == "global":
+            yield event.plain_result(self._export_data(fmt=export_format, scope=export_scope))
+            return
+        yield event.plain_result(
+            self._export_data(
+                fmt=export_format,
+                scope=export_scope,
+                session_type=session_type,
+                session_id=session_id,
+            )
+        )
+
+    @filter.command("fav-stats")
+    async def cmd_fav_stats(self, event: AstrMessageEvent):
+        """管理员查看统计：fav-stats [session|global]。"""
+        if not self.db:
+            yield event.plain_result("好感度系统未初始化")
+            return
+        if not self._is_admin_event(event):
+            yield event.plain_result(self._admin_only_message())
+            return
+        try:
+            session_type, session_id, _ = self._resolve_session_context(event)
+        except ValueError as exc:
+            yield event.plain_result(f"会话上下文异常: {exc}")
+            return
+        raw = (event.message_str or "").strip()
+        parts = raw.split()
+        if parts and parts[0].lstrip("/!").lower() == "fav-stats":
+            parts = parts[1:]
+        if len(parts) > 1:
+            yield event.plain_result("参数过多，用法：fav-stats [session|global]")
+            return
+        scope = "session"
+        try:
+            if parts:
+                scope = self._normalize_export_scope(parts[0].lower())
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        if scope == "global":
+            stats = self.db.get_stats(scope)
+            yield event.plain_result(self._format_stats_message(stats=stats, scope=scope))
+            return
+        stats = self.db.get_stats(scope, session_type=session_type, session_id=session_id)
+        yield event.plain_result(
+            self._format_stats_message(
+                stats=stats,
+                scope=scope,
+                session_type=session_type,
+                session_id=session_id,
+            )
         )
 
     @filter.command("fav-rl")

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import types
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -131,10 +132,16 @@ class _FakeEvent:
         group_id: str = "100",
         message_str: str = "",
         message_id: str = "m1",
+        private_chat: bool = False,
+        is_admin: bool = False,
+        role: str = "",
     ):
         self._sender_id = sender_id
         self._sender_name = sender_name
         self._group_id = group_id
+        self._private_chat = private_chat
+        self._is_admin = is_admin
+        self.role = role
         self.message_str = message_str
         self.message_obj = _MessageObj(message_id)
         self.unified_msg_origin = "origin"
@@ -146,7 +153,10 @@ class _FakeEvent:
         return self._sender_name
 
     def is_private_chat(self):
-        return False
+        return self._private_chat
+
+    def is_admin(self):
+        return self._is_admin
 
     def get_group_id(self):
         return self._group_id
@@ -172,11 +182,18 @@ class FavorabilityV2FlowTests(unittest.TestCase):
         self.td = tempfile.TemporaryDirectory()
         db_path = os.path.join(self.td.name, "fav.db")
         self.plugin.db = self.db_mod.FavorabilityDB(db_path)
+        self.plugin.data_dir = self.td.name
 
     def tearDown(self):
         if self.plugin.db:
             self.plugin.db.close()
         self.td.cleanup()
+
+    async def _collect(self, agen):
+        items = []
+        async for item in agen:
+            items.append(item)
+        return items
 
     def test_removed_tools_from_source(self):
         content = (ROOT / "main.py").read_text(encoding="utf-8")
@@ -265,6 +282,168 @@ class FavorabilityV2FlowTests(unittest.TestCase):
             "group", "100", "u1", "thanks", 0
         )
         self.assertEqual(cnt, 1)
+
+    def test_style_prompt_uses_effect_not_tier_name(self):
+        self.plugin.tiers = [
+            {"name": "A", "min": -100, "max": -1, "effect": "保持距离"},
+            {"name": "B", "min": 0, "max": 100, "effect": "温和主动"},
+        ]
+        event = _FakeEvent(sender_id="u-style", group_id="g-style")
+        self.plugin.db.add_user("group", "g-style", "u-style", 10)
+        req = _Req()
+        asyncio.run(self.plugin.on_llm_request(event, req))
+        self.assertIn("温和主动", req.system_prompt)
+
+    def test_tier_change_notice_injected_once(self):
+        self.plugin.db.add_user("group", "100", "u2", 9)
+        ok, result = self.plugin._apply_assessment_internal(
+            session_type="group",
+            session_id="100",
+            user_id="u2",
+            interaction_type="thanks",
+            intensity=1,
+            evidence="KW_THANKS",
+            source="auto_hook",
+        )
+        self.assertTrue(ok)
+        assert isinstance(result, dict)
+        self.assertTrue(result["tier_changed"])
+
+        event = _FakeEvent(sender_id="u2", group_id="100", message_id="tier-msg")
+        req1 = _Req()
+        asyncio.run(self.plugin.on_llm_request(event, req1))
+        self.assertIn("状态变化提示", req1.system_prompt)
+
+        req2 = _Req()
+        asyncio.run(self.plugin.on_llm_request(event, req2))
+        self.assertNotIn("状态变化提示", req2.system_prompt)
+
+    def test_management_tools_require_admin(self):
+        self.plugin.db.add_user("group", "100", "u1", 0)
+        non_admin_event = _FakeEvent(sender_id="u-op", group_id="100", is_admin=False)
+        denied = asyncio.run(self.plugin.fav_update(non_admin_event, "u1", 10))
+        self.assertIn("权限不足", denied)
+
+        admin_event = _FakeEvent(sender_id="u-op", group_id="100", is_admin=True)
+        ok_msg = asyncio.run(self.plugin.fav_update(admin_event, "u1", 10))
+        self.assertIn("好感度更新为 10", ok_msg)
+
+    def test_fav_query_shows_daily_cap_and_boundary_hint(self):
+        today = self.plugin._get_today_bucket()
+        self.plugin.db.add_user(
+            "group",
+            "100",
+            "u-boundary",
+            100,
+            daily_pos_gain=50,
+            daily_neg_gain=0,
+            daily_bucket=today,
+        )
+        event = _FakeEvent(sender_id="u-boundary", group_id="100")
+        results = asyncio.run(self._collect(self.plugin.cmd_fav_query(event)))
+        text = "\n".join(results)
+        self.assertIn("今日正向增益: 50/50", text)
+        self.assertIn("已达上限", text)
+        self.assertIn("触达边界", text)
+
+    def test_fav_reset_and_fav_reset_all(self):
+        today = self.plugin._get_today_bucket()
+        self.plugin.db.add_user(
+            "group",
+            "100",
+            "u-self",
+            66,
+            daily_pos_gain=10,
+            daily_neg_gain=3,
+            daily_bucket=today,
+        )
+        self.plugin.initial_level = 12
+        self_event = _FakeEvent(sender_id="u-self", group_id="100", message_str="fav-reset")
+        reset_messages = asyncio.run(self._collect(self.plugin.cmd_fav_reset(self_event)))
+        self.assertTrue(any("重置为 12" in msg for msg in reset_messages))
+        user = self.plugin.db.get_user("group", "100", "u-self")
+        assert user is not None
+        self.assertEqual(user.level, 12)
+        self.assertEqual(user.daily_pos_gain, 0)
+        self.assertEqual(user.daily_neg_gain, 0)
+
+        self.plugin.db.add_user("group", "100", "u-a", 1)
+        self.plugin.db.add_user("group", "100", "u-b", 2)
+        admin_event = _FakeEvent(
+            sender_id="u-admin", group_id="100", message_str="fav-reset-all", is_admin=True
+        )
+        all_messages = asyncio.run(self._collect(self.plugin.cmd_fav_reset_all(admin_event)))
+        self.assertTrue(any("已重置当前会话" in msg for msg in all_messages))
+        u_a = self.plugin.db.get_user("group", "100", "u-a")
+        u_b = self.plugin.db.get_user("group", "100", "u-b")
+        assert u_a is not None and u_b is not None
+        self.assertEqual(u_a.level, 12)
+        self.assertEqual(u_b.level, 12)
+
+    def test_fav_export_json_and_csv_files(self):
+        self.plugin.db.add_user("group", "100", "u1", 10)
+        self.plugin.db.upsert_current_nickname("group", "100", "u1", "用户1")
+        self.plugin.db.log_score_event(
+            "group",
+            "100",
+            "u1",
+            "thanks",
+            1,
+            4,
+            4,
+            1.0,
+            int(1730000000),
+            "KW_THANKS",
+        )
+        admin_event = _FakeEvent(sender_id="u-admin", group_id="100", is_admin=True)
+        json_msg = asyncio.run(self.plugin.fav_export(admin_event, format="json", scope="session"))
+        self.assertIn("导出成功（JSON）", json_msg)
+        json_path = json_msg.split("文件: ", 1)[1].strip()
+        self.assertTrue(os.path.exists(json_path))
+
+        csv_msg = asyncio.run(self.plugin.fav_export(admin_event, format="csv", scope="global"))
+        self.assertIn("导出成功（CSV ZIP）", csv_msg)
+        zip_path = csv_msg.split("文件: ", 1)[1].strip()
+        self.assertTrue(os.path.exists(zip_path))
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = set(zf.namelist())
+        self.assertTrue({"users.csv", "nicknames.csv", "score_events.csv"}.issubset(names))
+
+    def test_fav_stats_session_and_global(self):
+        self.plugin.db.add_user("group", "100", "u1", 10, daily_pos_gain=5, daily_neg_gain=0)
+        self.plugin.db.add_user("group", "200", "u2", 20, daily_pos_gain=8, daily_neg_gain=2)
+        self.plugin.db.log_score_event(
+            "group",
+            "100",
+            "u1",
+            "thanks",
+            1,
+            4,
+            4,
+            1.0,
+            int(1730000000),
+            "KW_THANKS",
+        )
+        self.plugin.db.log_score_event(
+            "group",
+            "200",
+            "u2",
+            "thanks",
+            1,
+            4,
+            4,
+            1.0,
+            int(1730000010),
+            "KW_THANKS",
+        )
+
+        admin_event = _FakeEvent(sender_id="u-admin", group_id="100", is_admin=True)
+        session_msg = asyncio.run(self.plugin.fav_stats(admin_event, scope="session"))
+        global_msg = asyncio.run(self.plugin.fav_stats(admin_event, scope="global"))
+        self.assertIn("统计范围: 会话 group:100", session_msg)
+        self.assertIn("用户数: 1", session_msg)
+        self.assertIn("统计范围: 全局", global_msg)
+        self.assertIn("用户数: 2", global_msg)
 
     def test_group_fav_init_uses_configured_initial_level(self):
         self.plugin.initial_level = 37

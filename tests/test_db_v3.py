@@ -1,7 +1,14 @@
 import os
 import sqlite3
+import sys
 import tempfile
+import time
 import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from db import FavorabilityDB
 
@@ -187,6 +194,118 @@ class FavorabilityDBV3Tests(unittest.TestCase):
             user = db.get_user("group", "100", "u1")
             assert user is not None
             self.assertEqual(user.level, 0)
+            db.close()
+
+    def test_reset_user_and_reset_session_users(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "favorability.db")
+            db = FavorabilityDB(db_path)
+            today = "2026-03-02"
+            db.add_user(
+                "group",
+                "100",
+                "u1",
+                66,
+                daily_pos_gain=8,
+                daily_neg_gain=2,
+                daily_bucket=today,
+            )
+            db.add_user("group", "100", "u2", 50, daily_pos_gain=1, daily_neg_gain=0)
+            db.add_user("group", "200", "u3", 70)
+
+            self.assertTrue(
+                db.reset_user(
+                    "group",
+                    "100",
+                    "u1",
+                    5,
+                    last_interaction_at=123456,
+                    daily_bucket=today,
+                )
+            )
+            user = db.get_user("group", "100", "u1")
+            assert user is not None
+            self.assertEqual(user.level, 5)
+            self.assertEqual(user.daily_pos_gain, 0)
+            self.assertEqual(user.daily_neg_gain, 0)
+            self.assertEqual(user.last_interaction_at, 123456)
+
+            reset_count = db.reset_session_users("group", "100", 9, daily_bucket=today)
+            self.assertEqual(reset_count, 2)
+            u1 = db.get_user("group", "100", "u1")
+            u2 = db.get_user("group", "100", "u2")
+            u3 = db.get_user("group", "200", "u3")
+            assert u1 is not None and u2 is not None and u3 is not None
+            self.assertEqual(u1.level, 9)
+            self.assertEqual(u2.level, 9)
+            self.assertEqual(u3.level, 70)
+            db.close()
+
+    def test_fetch_export_rows_scope_filters(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "favorability.db")
+            db = FavorabilityDB(db_path)
+            db.add_user("group", "100", "u1", 10)
+            db.add_user("group", "200", "u2", 20)
+            db.upsert_current_nickname("group", "100", "u1", "昵称1")
+            db.upsert_current_nickname("group", "200", "u2", "昵称2")
+            db.log_score_event(
+                "group", "100", "u1", "thanks", 1, 4, 4, 1.0, 1730000000, "KW_THANKS"
+            )
+            db.log_score_event(
+                "group", "200", "u2", "thanks", 1, 4, 4, 1.0, 1730000010, "KW_THANKS"
+            )
+
+            session_rows = db.fetch_export_rows(
+                "session", session_type="group", session_id="100"
+            )
+            global_rows = db.fetch_export_rows("global")
+            self.assertEqual(len(session_rows["users"]), 1)
+            self.assertEqual(len(session_rows["nicknames"]), 1)
+            self.assertEqual(len(session_rows["score_events"]), 1)
+            self.assertEqual(len(global_rows["users"]), 2)
+            self.assertEqual(len(global_rows["nicknames"]), 2)
+            self.assertEqual(len(global_rows["score_events"]), 2)
+            db.close()
+
+    def test_get_stats_scope_filters(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "favorability.db")
+            db = FavorabilityDB(db_path)
+            bucket = time.strftime("%Y-%m-%d", time.localtime())
+            db.add_user(
+                "group",
+                "100",
+                "u1",
+                10,
+                daily_pos_gain=7,
+                daily_neg_gain=1,
+                daily_bucket=bucket,
+            )
+            db.add_user(
+                "group",
+                "200",
+                "u2",
+                30,
+                daily_pos_gain=5,
+                daily_neg_gain=2,
+                daily_bucket=bucket,
+            )
+            db.log_score_event(
+                "group", "100", "u1", "thanks", 1, 4, 4, 1.0, 1730000000, "KW_THANKS"
+            )
+            db.log_score_event(
+                "group", "200", "u2", "thanks", 1, 4, 4, 1.0, 1730000010, "KW_THANKS"
+            )
+
+            session_stats = db.get_stats("session", session_type="group", session_id="100")
+            global_stats = db.get_stats("global")
+            self.assertEqual(session_stats["user_count"], 1)
+            self.assertEqual(global_stats["user_count"], 2)
+            self.assertEqual(session_stats["score_event_count"], 1)
+            self.assertEqual(global_stats["score_event_count"], 2)
+            self.assertEqual(session_stats["daily_pos_total"], 7)
+            self.assertEqual(global_stats["daily_pos_total"], 12)
             db.close()
 
 

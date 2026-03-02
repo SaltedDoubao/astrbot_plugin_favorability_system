@@ -4,7 +4,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 SCHEMA_VERSION = 3
 
@@ -853,6 +853,80 @@ class FavorabilityDB:
                 self.conn.commit()
             return cur.rowcount > 0
 
+    def reset_user(
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        level: int,
+        *,
+        last_interaction_at: Optional[int] = None,
+        daily_bucket: Optional[str] = None,
+        commit: bool = True,
+    ) -> bool:
+        """重置单个用户的好感度及日统计。"""
+        if daily_bucket is None:
+            daily_bucket = time.strftime("%Y-%m-%d", time.localtime())
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                UPDATE users
+                SET level = ?,
+                    last_interaction_at = ?,
+                    daily_pos_gain = 0,
+                    daily_neg_gain = 0,
+                    daily_bucket = ?
+                WHERE session_type = ? AND session_id = ? AND user_id = ?
+                """,
+                (
+                    level,
+                    last_interaction_at,
+                    daily_bucket,
+                    session_type,
+                    session_id,
+                    user_id,
+                ),
+            )
+            if commit:
+                self.conn.commit()
+            return cur.rowcount > 0
+
+    def reset_session_users(
+        self,
+        session_type: str,
+        session_id: str,
+        level: int,
+        *,
+        last_interaction_at: Optional[int] = None,
+        daily_bucket: Optional[str] = None,
+        commit: bool = True,
+    ) -> int:
+        """批量重置当前会话全部用户的好感度及日统计。"""
+        if daily_bucket is None:
+            daily_bucket = time.strftime("%Y-%m-%d", time.localtime())
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                UPDATE users
+                SET level = ?,
+                    last_interaction_at = ?,
+                    daily_pos_gain = 0,
+                    daily_neg_gain = 0,
+                    daily_bucket = ?
+                WHERE session_type = ? AND session_id = ?
+                """,
+                (
+                    level,
+                    last_interaction_at,
+                    daily_bucket,
+                    session_type,
+                    session_id,
+                ),
+            )
+            if commit:
+                self.conn.commit()
+            return int(cur.rowcount or 0)
+
     def upsert_current_nickname(
         self,
         session_type: str,
@@ -1086,6 +1160,179 @@ class FavorabilityDB:
                 (session_type, session_id, user_id, since_ts),
             ).fetchone()
             return int(row[0] if row and row[0] is not None else 0)
+
+    def _scope_filter(
+        self,
+        scope: str,
+        session_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> tuple[str, tuple[Any, ...]]:
+        normalized_scope = str(scope or "").strip().lower()
+        if normalized_scope not in {"session", "global"}:
+            raise ValueError("scope 仅支持 session 或 global")
+        if normalized_scope == "global":
+            return "", ()
+        if not session_type or not session_id:
+            raise ValueError("scope=session 时必须提供 session_type 与 session_id")
+        return " WHERE session_type = ? AND session_id = ? ", (session_type, session_id)
+
+    def fetch_export_rows(
+        self,
+        scope: str,
+        *,
+        session_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """导出 users/nicknames/score_events 三类原始数据。"""
+        where_clause, params = self._scope_filter(scope, session_type, session_id)
+        with self._lock:
+            user_rows = self.conn.execute(
+                f"""
+                SELECT
+                    session_type,
+                    session_id,
+                    user_id,
+                    level,
+                    last_interaction_at,
+                    daily_pos_gain,
+                    daily_neg_gain,
+                    daily_bucket
+                FROM users
+                {where_clause}
+                ORDER BY session_type, session_id, user_id
+                """,
+                params,
+            ).fetchall()
+            nickname_rows = self.conn.execute(
+                f"""
+                SELECT
+                    session_type,
+                    session_id,
+                    user_id,
+                    nickname,
+                    is_current,
+                    created_at
+                FROM nicknames
+                {where_clause}
+                ORDER BY session_type, session_id, user_id, created_at
+                """,
+                params,
+            ).fetchall()
+            event_rows = self.conn.execute(
+                f"""
+                SELECT
+                    id,
+                    session_type,
+                    session_id,
+                    user_id,
+                    interaction_type,
+                    intensity,
+                    raw_delta,
+                    final_delta,
+                    anti_spam_mul,
+                    created_at,
+                    evidence
+                FROM score_events
+                {where_clause}
+                ORDER BY id
+                """,
+                params,
+            ).fetchall()
+
+        return {
+            "users": [
+                {
+                    "session_type": r[0],
+                    "session_id": r[1],
+                    "user_id": r[2],
+                    "level": r[3],
+                    "last_interaction_at": r[4],
+                    "daily_pos_gain": r[5],
+                    "daily_neg_gain": r[6],
+                    "daily_bucket": r[7],
+                }
+                for r in user_rows
+            ],
+            "nicknames": [
+                {
+                    "session_type": r[0],
+                    "session_id": r[1],
+                    "user_id": r[2],
+                    "nickname": r[3],
+                    "is_current": r[4],
+                    "created_at": r[5],
+                }
+                for r in nickname_rows
+            ],
+            "score_events": [
+                {
+                    "id": r[0],
+                    "session_type": r[1],
+                    "session_id": r[2],
+                    "user_id": r[3],
+                    "interaction_type": r[4],
+                    "intensity": r[5],
+                    "raw_delta": r[6],
+                    "final_delta": r[7],
+                    "anti_spam_mul": r[8],
+                    "created_at": r[9],
+                    "evidence": r[10],
+                }
+                for r in event_rows
+            ],
+        }
+
+    def get_stats(
+        self,
+        scope: str,
+        *,
+        session_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """返回会话级或全局统计摘要。"""
+        where_clause, params = self._scope_filter(scope, session_type, session_id)
+        today_bucket = time.strftime("%Y-%m-%d", time.localtime())
+        with self._lock:
+            user_row = self.conn.execute(
+                f"""
+                SELECT
+                    COUNT(*),
+                    COALESCE(AVG(level), 0),
+                    COALESCE(MIN(level), 0),
+                    COALESCE(MAX(level), 0),
+                    COALESCE(SUM(CASE WHEN daily_bucket = ? THEN daily_pos_gain ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN daily_bucket = ? THEN daily_neg_gain ELSE 0 END), 0)
+                FROM users
+                {where_clause}
+                """,
+                (today_bucket, today_bucket, *params),
+            ).fetchone()
+            event_row = self.conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM score_events
+                {where_clause}
+                """,
+                params,
+            ).fetchone()
+
+        user_count = int(user_row[0] if user_row and user_row[0] is not None else 0)
+        avg_level = float(user_row[1] if user_row and user_row[1] is not None else 0.0)
+        min_level = int(user_row[2] if user_row and user_row[2] is not None else 0)
+        max_level = int(user_row[3] if user_row and user_row[3] is not None else 0)
+        daily_pos_total = int(user_row[4] if user_row and user_row[4] is not None else 0)
+        daily_neg_total = int(user_row[5] if user_row and user_row[5] is not None else 0)
+        score_event_count = int(event_row[0] if event_row and event_row[0] is not None else 0)
+        return {
+            "scope": str(scope or "").strip().lower(),
+            "user_count": user_count,
+            "avg_level": round(avg_level, 2),
+            "min_level": min_level,
+            "max_level": max_level,
+            "daily_pos_total": daily_pos_total,
+            "daily_neg_total": daily_neg_total,
+            "score_event_count": score_event_count,
+        }
 
     def close(self):
         with self._lock:
