@@ -109,7 +109,7 @@ git clone https://github.com/SaltedDoubao/astrbot_plugin_favorability_system.git
 
 ### 防刷与限幅
 
-- 同用户同类型正向事件，120 秒内收益递减：
+- 同用户同类型事件（正向/负向），120 秒内收益递减：
   - 第 1 次 `1.0`
   - 第 2 次 `0.75`
   - 第 3 次 `0.5`
@@ -117,6 +117,7 @@ git clone https://github.com/SaltedDoubao/astrbot_plugin_favorability_system.git
 - 单轮限幅：`[-12, +12]`
 - 10 分钟正向累计上限：`+20`
 - 自然日正向累计上限：`+50`
+- 自然日负向累计上限：`-50`（可配置）
 
 ## 配置项
 
@@ -131,10 +132,17 @@ git clone https://github.com/SaltedDoubao/astrbot_plugin_favorability_system.git
 | `auto_style_injection_enabled` | bool | true | 是否启用每轮短风格注入 |
 | `auto_assess_enabled` | bool | true | 是否启用每轮自动评分 |
 | `auto_assess_skip_commands` | bool | true | 自动评分时是否跳过插件命令消息 |
+| `daily_negative_cap` | int | 50 | 每日负向累计上限 |
+| `keyword_profile_path` | string | 空 | 关键词配置 JSON 路径（绝对路径或相对插件数据目录） |
 | `negative_policy` | string | conservative | 负向策略：conservative/balanced/aggressive |
 | `style_prompt_mode` | string | short_tier | 风格注入模式（当前仅 short_tier） |
 | `rule_version` | string | v1 | 自动评分规则版本（当前仅 v1） |
 | `tiers` | str(JSON) | 见下方 | 层级定义，必须连续覆盖 -100~100 |
+
+### 关键词外部配置（`keyword_profile_path`）
+
+- JSON 根节点为对象，支持以下键：`abuse`、`abuse_strong_hints`、`rude`、`thanks`、`celebration`、`deep_talk`、`helpful_dialogue`、`small_talk`。
+- 每个键值为字符串数组；留空或加载失败时会回退到内置默认词库。
 
 ## 数据结构
 

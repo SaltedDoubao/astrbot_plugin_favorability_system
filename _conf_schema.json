@@ -44,6 +44,16 @@
     "description": "自动评分时是否跳过插件命令消息",
     "default": true
   },
+  "daily_negative_cap": {
+    "type": "int",
+    "description": "每日负向累计上限，达到后当日继续负向事件将被裁剪",
+    "default": 50
+  },
+  "keyword_profile_path": {
+    "type": "string",
+    "description": "关键词配置 JSON 文件路径（支持绝对路径，或相对插件数据目录）",
+    "default": ""
+  },
   "negative_policy": {
     "type": "string",
     "description": "负向评分策略，支持 conservative/balanced/aggressive",
