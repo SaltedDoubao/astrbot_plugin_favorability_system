@@ -7,6 +7,30 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 SCHEMA_VERSION = 3
+SCORE_EVENTS_TABLE_SQL = """
+CREATE TABLE {if_not_exists}score_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_type TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    interaction_type TEXT NOT NULL,
+    intensity INTEGER NOT NULL,
+    raw_delta INTEGER NOT NULL,
+    final_delta INTEGER NOT NULL,
+    anti_spam_mul REAL NOT NULL,
+    created_at INTEGER NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (session_type, session_id, user_id)
+        REFERENCES users(session_type, session_id, user_id) ON DELETE CASCADE
+)
+"""
+SCORE_EVENTS_INDEXES_SQL = """
+CREATE INDEX IF NOT EXISTS idx_score_events_user_time
+ON score_events(session_type, session_id, user_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_score_events_type_time
+ON score_events(session_type, session_id, user_id, interaction_type, created_at);
+"""
 
 
 class SchemaMismatchError(RuntimeError):
@@ -145,35 +169,22 @@ class FavorabilityDB:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_nick_current_unique
             ON nicknames(session_type, session_id, user_id)
             WHERE is_current = 1;
-
-            CREATE TABLE IF NOT EXISTS score_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_type TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                interaction_type TEXT NOT NULL,
-                intensity INTEGER NOT NULL,
-                raw_delta INTEGER NOT NULL,
-                final_delta INTEGER NOT NULL,
-                anti_spam_mul REAL NOT NULL,
-                created_at INTEGER NOT NULL,
-                evidence TEXT NOT NULL DEFAULT '',
-                FOREIGN KEY (session_type, session_id, user_id)
-                    REFERENCES users(session_type, session_id, user_id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_score_events_user_time
-            ON score_events(session_type, session_id, user_id, created_at);
-
-            CREATE INDEX IF NOT EXISTS idx_score_events_type_time
-            ON score_events(session_type, session_id, user_id, interaction_type, created_at);
             """
         )
+        self._create_score_events_table(if_not_exists=True)
+        self._create_score_events_indexes()
         self.conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
         self.conn.commit()
+
+    def _create_score_events_table(self, *, if_not_exists: bool):
+        clause = "IF NOT EXISTS " if if_not_exists else ""
+        self.conn.execute(SCORE_EVENTS_TABLE_SQL.format(if_not_exists=clause))
+
+    def _create_score_events_indexes(self):
+        self.conn.executescript(SCORE_EVENTS_INDEXES_SQL)
 
     def _migrate_v2_to_v3(self):
         existing_tables = {
@@ -204,31 +215,8 @@ class FavorabilityDB:
             if "daily_bucket" not in user_columns:
                 self.conn.execute("ALTER TABLE users ADD COLUMN daily_bucket TEXT")
 
-            self.conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS score_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_type TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    interaction_type TEXT NOT NULL,
-                    intensity INTEGER NOT NULL,
-                    raw_delta INTEGER NOT NULL,
-                    final_delta INTEGER NOT NULL,
-                    anti_spam_mul REAL NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    evidence TEXT NOT NULL DEFAULT '',
-                    FOREIGN KEY (session_type, session_id, user_id)
-                        REFERENCES users(session_type, session_id, user_id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_score_events_user_time
-                ON score_events(session_type, session_id, user_id, created_at);
-
-                CREATE INDEX IF NOT EXISTS idx_score_events_type_time
-                ON score_events(session_type, session_id, user_id, interaction_type, created_at);
-                """
-            )
+            self._create_score_events_table(if_not_exists=True)
+            self._create_score_events_indexes()
 
             today_bucket = time.strftime("%Y-%m-%d", time.localtime())
             self.conn.execute(
@@ -363,25 +351,7 @@ class FavorabilityDB:
                 """
             )
             self.conn.execute("ALTER TABLE score_events RENAME TO score_events_old")
-            self.conn.execute(
-                """
-                CREATE TABLE score_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_type TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    interaction_type TEXT NOT NULL,
-                    intensity INTEGER NOT NULL,
-                    raw_delta INTEGER NOT NULL,
-                    final_delta INTEGER NOT NULL,
-                    anti_spam_mul REAL NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    evidence TEXT NOT NULL DEFAULT '',
-                    FOREIGN KEY (session_type, session_id, user_id)
-                        REFERENCES users(session_type, session_id, user_id) ON DELETE CASCADE
-                )
-                """
-            )
+            self._create_score_events_table(if_not_exists=False)
             self.conn.execute(
                 """
                 INSERT INTO score_events (
@@ -414,15 +384,7 @@ class FavorabilityDB:
                 """
             )
             self.conn.execute("DROP TABLE score_events_old")
-            self.conn.executescript(
-                """
-                CREATE INDEX IF NOT EXISTS idx_score_events_user_time
-                ON score_events(session_type, session_id, user_id, created_at);
-
-                CREATE INDEX IF NOT EXISTS idx_score_events_type_time
-                ON score_events(session_type, session_id, user_id, interaction_type, created_at);
-                """
-            )
+            self._create_score_events_indexes()
         finally:
             self.conn.execute("PRAGMA foreign_keys = ON")
 
@@ -1133,6 +1095,30 @@ class FavorabilityDB:
                   AND user_id = ?
                   AND interaction_type = ?
                   AND final_delta > 0
+                  AND created_at >= ?
+                """,
+                (session_type, session_id, user_id, interaction_type, since_ts),
+            ).fetchone()
+            return int(row[0] if row and row[0] is not None else 0)
+
+    def count_negative_events_by_type_since(
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        interaction_type: str,
+        since_ts: int,
+    ) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM score_events
+                WHERE session_type = ?
+                  AND session_id = ?
+                  AND user_id = ?
+                  AND interaction_type = ?
+                  AND final_delta < 0
                   AND created_at >= ?
                 """,
                 (session_type, session_id, user_id, interaction_type, since_ts),

@@ -3,7 +3,6 @@ import io
 import json
 import math
 import os
-import re
 import time
 import zipfile
 from typing import Any, Optional
@@ -12,101 +11,28 @@ from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+from .config_parser import PluginConfigParser
 from .db import FavorabilityDB, NicknameAmbiguousError, SchemaMismatchError, User
+from .event_hooks import (
+    handle_after_message_sent,
+    handle_on_llm_request,
+    handle_on_llm_response,
+)
+from .keywords import build_default_keyword_profile, load_keyword_profile
+from .rule_engine import (
+    DAILY_NEGATIVE_CAP_DEFAULT,
+    DAILY_POSITIVE_CAP,
+    AssessmentRecoverableError,
+    AssessmentRuleEngine,
+    AssessmentValidationError,
+)
+from .session_context import SessionContext, resolve_session_context, with_session_context
 
 REQUIRED_MIN_LEVEL = -100
 REQUIRED_MAX_LEVEL = 100
 
-INTERACTION_BASE_DELTA = {
-    "small_talk": 2,
-    "thanks": 4,
-    "helpful_dialogue": 5,
-    "deep_talk": 6,
-    "celebration": 9,
-    "cold": -2,
-    "rude": -6,
-    "abuse": -10,
-}
-
-INTENSITY_MULTIPLIER = {1: 0.8, 2: 1.0, 3: 1.25}
-POSITIVE_BIAS_FACTOR = 1.15
-ANTI_SPAM_WINDOW_SEC = 120
-TEN_MIN_WINDOW_SEC = 600
-TEN_MIN_POSITIVE_CAP = 20
-DAILY_POSITIVE_CAP = 50
-PER_ROUND_MIN_DELTA = -12
-PER_ROUND_MAX_DELTA = 12
-MAX_EVIDENCE_LENGTH = 120
 PENDING_CONTEXT_TTL_SEC = 900
 MAX_PENDING_CONTEXT_SIZE = 2048
-
-ABUSE_KEYWORDS = {
-    "傻逼",
-    "煞笔",
-    "傻x",
-    "傻叉",
-    "脑残",
-    "废物",
-    "垃圾",
-    "去死",
-    "妈的",
-    "操你",
-    "fuck you",
-}
-ABUSE_STRONG_HINTS = {"你妈", "全家", "滚出", "sb", "cnm", "nmsl"}
-RUDE_KEYWORDS = {"闭嘴", "滚", "别烦", "弱智", "蠢", "有病", "讨厌你"}
-THANKS_KEYWORDS = {
-    "谢谢",
-    "感谢",
-    "辛苦了",
-    "多谢",
-    "感激",
-    "thanks",
-    "thank you",
-    "thx",
-}
-CELEBRATION_KEYWORDS = {
-    "生日快乐",
-    "恭喜",
-    "庆祝",
-    "好耶",
-    "太棒了",
-    "厉害",
-    "牛逼",
-    "congrats",
-    "congratulations",
-}
-DEEP_TALK_KEYWORDS = {
-    "深入",
-    "详细",
-    "原理",
-    "推导",
-    "证明",
-    "分析",
-    "为什么",
-    "how",
-    "why",
-}
-HELPFUL_DIALOGUE_KEYWORDS = {
-    "请",
-    "麻烦",
-    "帮我",
-    "可以",
-    "一起",
-    "协助",
-    "建议",
-    "步骤",
-}
-SMALL_TALK_KEYWORDS = {
-    "你好",
-    "在吗",
-    "早上好",
-    "晚安",
-    "哈哈",
-    "嗨",
-    "hello",
-    "hi",
-}
 COMMAND_ALIASES = {
     "fav-init",
     "fav-rl",
@@ -142,56 +68,68 @@ class FavorabilityPlugin(Star):
         self.negative_policy: str = "conservative"
         self.style_prompt_mode: str = "short_tier"
         self.rule_version: str = "v1"
+        self.keyword_profile_path: str = ""
+        self.daily_negative_cap: int = DAILY_NEGATIVE_CAP_DEFAULT
         self.data_dir: str = ""
+        self.keyword_profile: dict[str, set[str]] = build_default_keyword_profile()
         self._pending_assessment: dict[str, dict[str, Any]] = {}
         self._recent_assessed_keys: dict[str, int] = {}
         self._pending_tier_notice: dict[str, dict[str, Any]] = {}
+        self.pending_context_ttl_sec: int = PENDING_CONTEXT_TTL_SEC
+        self._rule_engine = AssessmentRuleEngine(self)
 
     async def initialize(self):
         try:
-            self.min_level = self._parse_required_int("min_level")
-            self.max_level = self._parse_required_int("max_level")
+            parser = PluginConfigParser(self._config)
+            self.min_level = parser.parse_required_int("min_level")
+            self.max_level = parser.parse_required_int("max_level")
             self._validate_level_bounds()
-            self.initial_level = self._parse_optional_int(
+            self.initial_level = parser.parse_optional_int(
                 "initial_level",
                 0,
                 min_value=self.min_level,
                 max_value=self.max_level,
             )
 
-            tiers = self._parse_required_tiers("tiers")
+            tiers = parser.parse_required_tiers("tiers")
             self.tiers = self._validate_and_normalize_tiers(tiers)
 
-            self.decay_enabled = self._parse_optional_bool("decay_enabled", False)
-            self.idle_days_threshold = self._parse_optional_int(
+            self.decay_enabled = parser.parse_optional_bool("decay_enabled", False)
+            self.idle_days_threshold = parser.parse_optional_int(
                 "idle_days_threshold", 14, min_value=0
             )
-            self.decay_per_day = self._parse_optional_int(
+            self.decay_per_day = parser.parse_optional_int(
                 "decay_per_day", 1, min_value=1
             )
-            self.auto_style_injection_enabled = self._parse_optional_bool(
+            self.auto_style_injection_enabled = parser.parse_optional_bool(
                 "auto_style_injection_enabled", True
             )
-            self.auto_assess_enabled = self._parse_optional_bool(
+            self.auto_assess_enabled = parser.parse_optional_bool(
                 "auto_assess_enabled", True
             )
-            self.auto_assess_skip_commands = self._parse_optional_bool(
+            self.auto_assess_skip_commands = parser.parse_optional_bool(
                 "auto_assess_skip_commands", True
             )
-            self.negative_policy = self._parse_optional_choice(
+            self.negative_policy = parser.parse_optional_choice(
                 "negative_policy",
                 "conservative",
                 {"conservative", "balanced", "aggressive"},
             )
-            self.style_prompt_mode = self._parse_optional_choice(
+            self.style_prompt_mode = parser.parse_optional_choice(
                 "style_prompt_mode",
                 "short_tier",
                 {"short_tier"},
             )
-            self.rule_version = self._parse_optional_choice(
+            self.rule_version = parser.parse_optional_choice(
                 "rule_version",
                 "v1",
                 {"v1"},
+            )
+            self.keyword_profile_path = parser.parse_optional_str("keyword_profile_path", "")
+            self.daily_negative_cap = parser.parse_optional_int(
+                "daily_negative_cap",
+                DAILY_NEGATIVE_CAP_DEFAULT,
+                min_value=0,
             )
 
             try:
@@ -214,6 +152,11 @@ class FavorabilityPlugin(Star):
             self.data_dir = data_dir
             db_path = os.path.join(data_dir, "favorability.db")
             self.db = FavorabilityDB(db_path)
+            self.keyword_profile = load_keyword_profile(
+                self.keyword_profile_path,
+                self.data_dir,
+                logger,
+            )
             logger.info(f"[FavorabilityPlugin] 数据库已初始化: {db_path}")
         except (ValueError, SchemaMismatchError) as exc:
             logger.error(f"[FavorabilityPlugin] 初始化失败: {exc}")
@@ -391,20 +334,8 @@ class FavorabilityPlugin(Star):
         return self._clamp_level(self.initial_level)
 
     def _resolve_session_context(self, event: AstrMessageEvent) -> tuple[str, str, str]:
-        sender_id = str(event.get_sender_id() or "").strip()
-        if not sender_id:
-            raise ValueError("无法解析发送者 ID")
-
-        sender_name = str(event.get_sender_name() or "").strip() or sender_id
-
-        if event.is_private_chat():
-            return "private", sender_id, sender_name
-
-        group_id = str(event.get_group_id() or "").strip()
-        if not group_id:
-            raise ValueError("群聊事件缺少 group_id，无法定位会话")
-
-        return "group", group_id, sender_name
+        ctx = resolve_session_context(event)
+        return ctx.session_type, ctx.session_id, ctx.sender_name
 
     def _format_session(self, session_type: str, session_id: str) -> str:
         return f"{session_type}:{session_id}"
@@ -474,6 +405,13 @@ class FavorabilityPlugin(Star):
             "data",
             "plugin_data",
             "astrbot_plugin_favorability_system",
+        )
+
+    def _reload_keyword_profile(self):
+        self.keyword_profile = load_keyword_profile(
+            self.keyword_profile_path,
+            self._get_effective_data_dir(),
+            logger,
         )
 
     def _write_json_export(
@@ -766,92 +704,10 @@ class FavorabilityPlugin(Star):
         token = text.split()[0].lstrip("/!").lower()
         return token in COMMAND_ALIASES
 
-    def _normalize_text(self, text: str) -> str:
-        lowered = str(text or "").lower()
-        return re.sub(r"\s+", " ", lowered).strip()
-
-    def _keyword_hit(self, text: str, keywords: set[str]) -> Optional[str]:
-        for keyword in keywords:
-            if keyword in text:
-                return keyword
-        return None
-
     def _classify_interaction_rule_v1(
         self, text: str
     ) -> Optional[dict[str, str | int]]:
-        normalized = self._normalize_text(text)
-        if not normalized:
-            return None
-
-        abuse_keyword = self._keyword_hit(normalized, ABUSE_KEYWORDS)
-        if abuse_keyword:
-            strong_hit = any(hint in normalized for hint in ABUSE_STRONG_HINTS)
-            intensity = 3 if strong_hit else 2
-            return {
-                "interaction_type": "abuse",
-                "intensity": intensity,
-                "evidence": "KW_ABUSE_STRONG"
-                if intensity == 3
-                else "KW_ABUSE",
-            }
-
-        rude_keyword = self._keyword_hit(normalized, RUDE_KEYWORDS)
-        if rude_keyword:
-            return {
-                "interaction_type": "rude",
-                "intensity": 2,
-                "evidence": "KW_RUDE",
-            }
-
-        celebration_keyword = self._keyword_hit(normalized, CELEBRATION_KEYWORDS)
-        if celebration_keyword:
-            return {
-                "interaction_type": "celebration",
-                "intensity": 2,
-                "evidence": "KW_CELEBRATION",
-            }
-
-        thanks_keyword = self._keyword_hit(normalized, THANKS_KEYWORDS)
-        if thanks_keyword:
-            return {
-                "interaction_type": "thanks",
-                "intensity": 1,
-                "evidence": "KW_THANKS",
-            }
-
-        deep_keyword = self._keyword_hit(normalized, DEEP_TALK_KEYWORDS)
-        if deep_keyword:
-            intensity = 2 if len(normalized) >= 30 else 1
-            return {
-                "interaction_type": "deep_talk",
-                "intensity": intensity,
-                "evidence": "KW_DEEP_TALK",
-            }
-
-        helpful_keyword = self._keyword_hit(normalized, HELPFUL_DIALOGUE_KEYWORDS)
-        if helpful_keyword:
-            return {
-                "interaction_type": "helpful_dialogue",
-                "intensity": 1,
-                "evidence": "KW_HELPFUL",
-            }
-
-        small_talk_keyword = self._keyword_hit(normalized, SMALL_TALK_KEYWORDS)
-        if small_talk_keyword:
-            return {
-                "interaction_type": "small_talk",
-                "intensity": 1,
-                "evidence": "KW_SMALL_TALK",
-            }
-
-        if self.negative_policy != "conservative":
-            if "冷淡" in normalized or "敷衍" in normalized:
-                return {
-                    "interaction_type": "cold",
-                    "intensity": 1,
-                    "evidence": "KW_COLD",
-                }
-        return None
+        return self._rule_engine.classify_interaction_rule_v1(text)
 
     def _build_short_style_prompt(self, level: int) -> str:
         tier = self._get_tier(level)
@@ -875,313 +731,74 @@ class FavorabilityPlugin(Star):
     ) -> tuple[bool, dict[str, Any] | str]:
         if not self.db:
             return False, "好感度系统未初始化"
+        try:
+            result = self._rule_engine.apply_assessment(
+                session_type=session_type,
+                session_id=session_id,
+                user_id=user_id,
+                interaction_type=interaction_type,
+                intensity=intensity,
+                evidence=evidence,
+                source=source,
+            )
+        except AssessmentValidationError as exc:
+            return False, str(exc)
+        except AssessmentRecoverableError:
+            logger.exception("[FavorabilityPlugin] 评分事务失败（可恢复）")
+            return False, "评分写入失败，请稍后重试"
+        except Exception:
+            logger.exception("[FavorabilityPlugin] 评分事务失败（未预期异常）")
+            raise
 
         normalized_id = str(user_id or "").strip()
-        if not normalized_id:
-            return False, "user_id 不能为空"
-
-        interaction_key = str(interaction_type or "").strip().lower()
-        if interaction_key not in INTERACTION_BASE_DELTA:
-            allow = ", ".join(INTERACTION_BASE_DELTA.keys())
-            return False, f"interaction_type 非法，允许值: {allow}"
-
-        try:
-            normalized_intensity = int(intensity)
-        except (TypeError, ValueError):
-            return False, f"intensity {intensity} 不是有效整数"
-        if normalized_intensity not in INTENSITY_MULTIPLIER:
-            return False, "intensity 必须是 1、2、3"
-
-        try:
-            with self.db.immediate_transaction():
-                user, _ = self._coerce_user(
-                    session_type,
-                    session_id,
-                    normalized_id,
-                    "",
-                    update_nickname=False,
-                    db_commit=False,
-                )
-                if not user:
-                    return False, "无法初始化用户资料"
-
-                now_ts = int(time.time())
-                user = self._refresh_daily_bucket(
-                    session_type, session_id, user, now_ts, db_commit=False
-                )
-                user = self._apply_decay_if_needed(
-                    session_type, session_id, user, now_ts, db_commit=False
-                )
-
-                old_level = user.level
-                tier_before = self._get_tier(old_level)
-                tier_before_name = tier_before["name"] if tier_before else "未知"
-                base_delta = INTERACTION_BASE_DELTA[interaction_key]
-                intensity_mul = INTENSITY_MULTIPLIER[normalized_intensity]
-                raw_delta = round(base_delta * intensity_mul)
-
-                positive_bias = 1.0
-                if raw_delta > 0:
-                    positive_bias = POSITIVE_BIAS_FACTOR
-                    raw_delta = round(raw_delta * positive_bias)
-
-                anti_spam_mul = 1.0
-                if raw_delta > 0:
-                    positive_count = self.db.count_positive_events_by_type_since(
-                        session_type,
-                        session_id,
-                        normalized_id,
-                        interaction_key,
-                        now_ts - ANTI_SPAM_WINDOW_SEC,
-                    )
-                    occurrence = positive_count + 1
-                    if occurrence == 1:
-                        anti_spam_mul = 1.0
-                    elif occurrence == 2:
-                        anti_spam_mul = 0.75
-                    elif occurrence == 3:
-                        anti_spam_mul = 0.5
-                    else:
-                        anti_spam_mul = 0.3
-
-                final_delta = round(raw_delta * anti_spam_mul)
-                cap_clip = {
-                    "per_round": False,
-                    "ten_min_positive": False,
-                    "daily_positive": False,
-                    "global_level": False,
-                }
-
-                clipped = max(PER_ROUND_MIN_DELTA, min(PER_ROUND_MAX_DELTA, final_delta))
-                if clipped != final_delta:
-                    cap_clip["per_round"] = True
-                final_delta = clipped
-
-                if final_delta > 0:
-                    ten_min_gain = self.db.sum_positive_delta_since(
-                        session_type,
-                        session_id,
-                        normalized_id,
-                        now_ts - TEN_MIN_WINDOW_SEC,
-                    )
-                    remaining_10m = max(0, TEN_MIN_POSITIVE_CAP - ten_min_gain)
-                    if final_delta > remaining_10m:
-                        final_delta = remaining_10m
-                        cap_clip["ten_min_positive"] = True
-
-                    remaining_daily = max(0, DAILY_POSITIVE_CAP - user.daily_pos_gain)
-                    if final_delta > remaining_daily:
-                        final_delta = remaining_daily
-                        cap_clip["daily_positive"] = True
-
-                proposed_level = user.level + final_delta
-                new_level = self._clamp_level(proposed_level)
-                if new_level != proposed_level:
-                    cap_clip["global_level"] = True
-
-                effective_delta = new_level - user.level
-                tier_after = self._get_tier(new_level)
-                tier_after_name = tier_after["name"] if tier_after else "未知"
-                daily_pos_gain = user.daily_pos_gain
-                daily_neg_gain = user.daily_neg_gain
-                if effective_delta > 0:
-                    daily_pos_gain += effective_delta
-                elif effective_delta < 0:
-                    daily_neg_gain += abs(effective_delta)
-
-                user.daily_bucket = user.daily_bucket or self._get_today_bucket(now_ts)
-                self.db.update_level(
-                    session_type,
-                    session_id,
-                    normalized_id,
-                    new_level,
-                    last_interaction_at=now_ts,
-                    daily_pos_gain=daily_pos_gain,
-                    daily_neg_gain=daily_neg_gain,
-                    daily_bucket=user.daily_bucket,
-                    commit=False,
-                )
-
-                evidence_text = str(evidence or "").strip()[:MAX_EVIDENCE_LENGTH]
-                self.db.log_score_event(
-                    session_type,
-                    session_id,
-                    normalized_id,
-                    interaction_key,
-                    normalized_intensity,
-                    raw_delta,
-                    effective_delta,
-                    anti_spam_mul,
-                    now_ts,
-                    evidence_text,
-                    commit=False,
-                )
-        except Exception as exc:
-            logger.error(f"[FavorabilityPlugin] 评分事务失败: {exc}")
-            return False, "评分写入失败，请稍后重试"
-
-        if tier_before_name != tier_after_name:
+        now_ts = int(time.time())
+        if result["tier_before"] != result["tier_after"]:
             self._pending_tier_notice[
                 self._build_user_scope_key(session_type, session_id, normalized_id)
             ] = {
                 "created_at": now_ts,
-                "from_tier": tier_before_name,
-                "to_tier": tier_after_name,
+                "from_tier": result["tier_before"],
+                "to_tier": result["tier_after"],
             }
-
-        result = {
-            "old_level": old_level,
-            "new_level": new_level,
-            "raw_delta": raw_delta,
-            "final_delta": effective_delta,
-            "factors": {
-                "intensity_mul": intensity_mul,
-                "positive_bias": positive_bias,
-                "anti_spam_mul": anti_spam_mul,
-                "cap_clip": cap_clip,
-            },
-            "tier_before": tier_before_name,
-            "tier_after": tier_after_name,
-            "tier_changed": tier_before_name != tier_after_name,
-        }
-
-        logger.info(
-            "[FavorabilityPlugin] assess"
-            f" source={source}"
-            f" session={self._format_session(session_type, session_id)}"
-            f" user={normalized_id}"
-            f" type={interaction_key}"
-            f" intensity={normalized_intensity}"
-            f" old={old_level} new={new_level}"
-            f" raw={raw_delta} final={effective_delta}"
-            f" anti_spam_mul={anti_spam_mul}"
-            f" cap={cap_clip}"
-            f" evidence={evidence_text}"
-        )
         return True, result
 
     @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent, req):
-        if not self.auto_style_injection_enabled or not self.db:
+    @with_session_context(mode="silent")
+    async def on_llm_request(
+        self,
+        event: AstrMessageEvent,
+        req,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
+        if not session_ctx:
             return
-        try:
-            session_type, session_id, sender_name = self._resolve_session_context(event)
-        except ValueError:
-            return
-
-        sender_id = str(event.get_sender_id() or "").strip()
-        if not sender_id:
-            return
-
-        user, _ = self._coerce_user(session_type, session_id, sender_id, sender_name)
-        if not user:
-            return
-
-        now_ts = int(time.time())
-        user = self._refresh_daily_bucket(session_type, session_id, user, now_ts)
-        user = self._apply_decay_if_needed(session_type, session_id, user, now_ts)
-        if self.style_prompt_mode != "short_tier":
-            return
-
-        prompt_lines = [self._build_short_style_prompt(user.level)]
-        tier_notice = self._build_tier_change_notice(
-            session_type, session_id, sender_id, now_ts
-        )
-        if tier_notice:
-            prompt_lines.append(tier_notice)
-        stable_hint = self._stable_status_hint(user)
-        if stable_hint:
-            prompt_lines.append(f"状态提示：{stable_hint}。请保持自然与分寸。")
-
-        current_prompt = str(getattr(req, "system_prompt", "") or "")
-        setattr(req, "system_prompt", f"{current_prompt}\n" + "\n".join(prompt_lines))
-        setattr(req, "system_prompt", str(getattr(req, "system_prompt", "")).strip())
+        await handle_on_llm_request(self, event, req, session_ctx=session_ctx)
 
     @filter.on_llm_response()
-    async def on_llm_response(self, event: AstrMessageEvent, resp):
-        if not self.auto_assess_enabled or not self.db:
+    @with_session_context(mode="silent")
+    async def on_llm_response(
+        self,
+        event: AstrMessageEvent,
+        resp,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
+        if not session_ctx:
             return
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError:
-            return
-
-        sender_id = str(event.get_sender_id() or "").strip()
-        if not sender_id:
-            return
-
-        user_text = str(getattr(event, "message_str", "") or "").strip()
-        if not user_text:
-            return
-        if self.auto_assess_skip_commands and self._is_command_message(user_text):
-            return
-
-        classification = self._classify_interaction_rule_v1(user_text)
-        if not classification:
-            return
-
-        completion_text = str(getattr(resp, "completion_text", "") or "").strip()
-        event_key = self._build_event_key(session_type, session_id, sender_id, event)
-        now_ts = int(time.time())
-        self._cleanup_cache(self._pending_assessment, now_ts)
-        self._pending_assessment[event_key] = {
-            "created_at": now_ts,
-            "session_type": session_type,
-            "session_id": session_id,
-            "user_id": sender_id,
-            "user_text": user_text,
-            "bot_text": completion_text[:200],
-            "interaction_type": classification["interaction_type"],
-            "intensity": classification["intensity"],
-            "evidence": classification["evidence"],
-        }
+        await handle_on_llm_response(self, event, resp, session_ctx=session_ctx)
 
     @filter.after_message_sent()
-    async def after_message_sent(self, event: AstrMessageEvent):
-        if not self.auto_assess_enabled or not self.db:
+    @with_session_context(mode="silent")
+    async def after_message_sent(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
+        if not session_ctx:
             return
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError:
-            return
-        sender_id = str(event.get_sender_id() or "").strip()
-        if not sender_id:
-            return
-
-        event_key = self._build_event_key(session_type, session_id, sender_id, event)
-        pending = self._pending_assessment.pop(event_key, None)
-        if not pending:
-            return
-
-        now_ts = int(time.time())
-        # recent cache 仅用于兜底防重复（如事件重复分发）
-        expired = [
-            key
-            for key, ts in self._recent_assessed_keys.items()
-            if now_ts - ts > PENDING_CONTEXT_TTL_SEC
-        ]
-        for key in expired:
-            self._recent_assessed_keys.pop(key, None)
-        if event_key in self._recent_assessed_keys:
-            return
-        self._recent_assessed_keys[event_key] = now_ts
-
-        ok, result = self._apply_assessment_internal(
-            session_type=pending["session_type"],
-            session_id=pending["session_id"],
-            user_id=pending["user_id"],
-            interaction_type=pending["interaction_type"],
-            intensity=pending["intensity"],
-            evidence=pending["evidence"],
-            source="auto_hook",
-        )
-        if not ok:
-            logger.warning(
-                "[FavorabilityPlugin] auto_assess skipped"
-                f" reason={result}"
-                f" session={self._format_session(session_type, session_id)}"
-                f" user={sender_id}"
-            )
+        await handle_after_message_sent(self, event, session_ctx=session_ctx)
 
     def _export_data(
         self,
@@ -1243,7 +860,14 @@ class FavorabilityPlugin(Star):
         )
 
     @llm_tool(name="fav_query")
-    async def fav_query(self, event: AstrMessageEvent, identifier: str):
+    @with_session_context(mode="return_error")
+    async def fav_query(
+        self,
+        event: AstrMessageEvent,
+        identifier: str,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """查询当前会话内用户的好感度等级和层级效果。identifier 可以是用户 ID 或当前昵称。
 
         Args:
@@ -1252,10 +876,10 @@ class FavorabilityPlugin(Star):
         if not self.db:
             return "好感度系统未初始化"
 
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
 
         normalized_identifier = str(identifier or "").strip()
         if not normalized_identifier:
@@ -1298,7 +922,15 @@ class FavorabilityPlugin(Star):
         )
 
     @llm_tool(name="fav_update")
-    async def fav_update(self, event: AstrMessageEvent, user_id: str, level: int):
+    @with_session_context(mode="return_error")
+    async def fav_update(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        level: int,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """设置当前会话内用户的好感度等级（绝对值）。
 
         Args:
@@ -1310,10 +942,10 @@ class FavorabilityPlugin(Star):
         if not self._is_admin_event(event):
             return self._admin_only_message()
 
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
 
         try:
             target_level = int(level)
@@ -1340,7 +972,15 @@ class FavorabilityPlugin(Star):
         return msg
 
     @llm_tool(name="fav_add_user")
-    async def fav_add_user(self, event: AstrMessageEvent, user_id: str, nickname: str):
+    @with_session_context(mode="return_error")
+    async def fav_add_user(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        nickname: str,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """在当前会话注册新用户并设置当前昵称。初始好感度由配置范围约束。
 
         Args:
@@ -1352,10 +992,10 @@ class FavorabilityPlugin(Star):
         if not self._is_admin_event(event):
             return self._admin_only_message()
 
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
 
         initial_level = self._get_initial_level_for_new_user()
         normalized_nickname = str(nickname or "").strip() or user_id
@@ -1378,7 +1018,14 @@ class FavorabilityPlugin(Star):
         )
 
     @llm_tool(name="fav_remove_user")
-    async def fav_remove_user(self, event: AstrMessageEvent, user_id: str):
+    @with_session_context(mode="return_error")
+    async def fav_remove_user(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """删除当前会话内用户及其所有昵称记录。
 
         Args:
@@ -1389,10 +1036,10 @@ class FavorabilityPlugin(Star):
         if not self._is_admin_event(event):
             return self._admin_only_message()
 
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
 
         if not self.db.remove_user(session_type, session_id, user_id):
             return (
@@ -1406,8 +1053,14 @@ class FavorabilityPlugin(Star):
         )
 
     @llm_tool(name="fav_add_nickname")
+    @with_session_context(mode="return_error")
     async def fav_add_nickname(
-        self, event: AstrMessageEvent, user_id: str, nickname: str
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        nickname: str,
+        *,
+        session_ctx: Optional[SessionContext] = None,
     ):
         """更新当前会话内用户的当前昵称，旧昵称会自动沉淀为曾用名。
 
@@ -1420,10 +1073,10 @@ class FavorabilityPlugin(Star):
         if not self._is_admin_event(event):
             return self._admin_only_message()
 
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
 
         user = self.db.get_user(session_type, session_id, user_id)
         if not user:
@@ -1454,8 +1107,14 @@ class FavorabilityPlugin(Star):
         return f"已为用户「{user_id}」设置当前昵称「{new_nickname}」"
 
     @llm_tool(name="fav_remove_nickname")
+    @with_session_context(mode="return_error")
     async def fav_remove_nickname(
-        self, event: AstrMessageEvent, user_id: str, nickname: str
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        nickname: str,
+        *,
+        session_ctx: Optional[SessionContext] = None,
     ):
         """删除当前会话内用户的当前昵称。
 
@@ -1468,10 +1127,10 @@ class FavorabilityPlugin(Star):
         if not self._is_admin_event(event):
             return self._admin_only_message()
 
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
 
         user = self.db.get_user(session_type, session_id, user_id)
         if not user:
@@ -1508,16 +1167,23 @@ class FavorabilityPlugin(Star):
         return f"等级 {normalized_level} 对应层级【{tier['name']}】：{tier['effect']}"
 
     @llm_tool(name="fav_reset")
-    async def fav_reset(self, event: AstrMessageEvent, user_id: str):
+    @with_session_context(mode="return_error")
+    async def fav_reset(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """管理员重置当前会话内指定用户的好感度与日统计。"""
         if not self.db:
             return "好感度系统未初始化"
         if not self._is_admin_event(event):
             return self._admin_only_message()
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
         target_user = str(user_id or "").strip()
         if not target_user:
             return "user_id 不能为空"
@@ -1542,16 +1208,22 @@ class FavorabilityPlugin(Star):
         )
 
     @llm_tool(name="fav_reset_all")
-    async def fav_reset_all(self, event: AstrMessageEvent):
+    @with_session_context(mode="return_error")
+    async def fav_reset_all(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """管理员重置当前会话全部用户的好感度与日统计。"""
         if not self.db:
             return "好感度系统未初始化"
         if not self._is_admin_event(event):
             return self._admin_only_message()
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
         now_ts = int(time.time())
         initial_level = self._get_initial_level_for_new_user()
         count = self.db.reset_session_users(
@@ -1567,11 +1239,14 @@ class FavorabilityPlugin(Star):
         )
 
     @llm_tool(name="fav_export")
+    @with_session_context(mode="return_error")
     async def fav_export(
         self,
         event: AstrMessageEvent,
         format: str = "json",
         scope: str = "session",
+        *,
+        session_ctx: Optional[SessionContext] = None,
     ):
         """管理员导出当前会话或全局数据到文件。"""
         if not self.db:
@@ -1583,10 +1258,10 @@ class FavorabilityPlugin(Star):
             normalized_scope = self._normalize_export_scope(scope)
         except ValueError as exc:
             return str(exc)
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
         if normalized_scope == "global":
             return self._export_data(fmt=normalized_format, scope=normalized_scope)
         return self._export_data(
@@ -1597,7 +1272,14 @@ class FavorabilityPlugin(Star):
         )
 
     @llm_tool(name="fav_stats")
-    async def fav_stats(self, event: AstrMessageEvent, scope: str = "session"):
+    @with_session_context(mode="return_error")
+    async def fav_stats(
+        self,
+        event: AstrMessageEvent,
+        scope: str = "session",
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """管理员查看当前会话或全局统计。"""
         if not self.db:
             return "好感度系统未初始化"
@@ -1607,10 +1289,10 @@ class FavorabilityPlugin(Star):
             normalized_scope = self._normalize_export_scope(scope)
         except ValueError as exc:
             return str(exc)
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            return f"会话上下文异常: {exc}"
+        if not session_ctx:
+            return "会话上下文异常: 缺少会话上下文"
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
         if normalized_scope == "global":
             stats = self.db.get_stats(normalized_scope)
             return self._format_stats_message(stats=stats, scope=normalized_scope)
@@ -1625,22 +1307,25 @@ class FavorabilityPlugin(Star):
         )
 
     @filter.command("好感度查询")
-    async def cmd_fav_query(self, event: AstrMessageEvent):
+    @with_session_context(mode="yield_error")
+    async def cmd_fav_query(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """查询自己在当前会话中的好感度等级和层级信息。"""
         if not self.db:
             yield event.plain_result("好感度系统未初始化")
             return
 
-        try:
-            session_type, session_id, sender_name = self._resolve_session_context(event)
-        except ValueError as exc:
-            yield event.plain_result(f"会话上下文异常: {exc}")
+        if not session_ctx:
+            yield event.plain_result("会话上下文异常: 缺少会话上下文")
             return
-
-        sender_id = str(event.get_sender_id() or "").strip()
-        if not sender_id:
-            yield event.plain_result("无法获取你的用户 ID")
-            return
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
+        sender_name = session_ctx.sender_name
+        sender_id = session_ctx.sender_id
 
         user = self.db.get_user(session_type, session_id, sender_id)
         if not user:
@@ -1666,22 +1351,25 @@ class FavorabilityPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.command("fav-init")
-    async def cmd_fav_init(self, event: AstrMessageEvent):
+    @with_session_context(mode="yield_error")
+    async def cmd_fav_init(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """在当前会话中注册自己的好感度记录。"""
         if not self.db:
             yield event.plain_result("好感度系统未初始化")
             return
 
-        try:
-            session_type, session_id, sender_name = self._resolve_session_context(event)
-        except ValueError as exc:
-            yield event.plain_result(f"会话上下文异常: {exc}")
+        if not session_ctx:
+            yield event.plain_result("会话上下文异常: 缺少会话上下文")
             return
-
-        sender_id = str(event.get_sender_id() or "").strip()
-        if not sender_id:
-            yield event.plain_result("无法获取你的用户 ID")
-            return
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
+        sender_name = session_ctx.sender_name
+        sender_id = session_ctx.sender_id
 
         user = self.db.get_user(session_type, session_id, sender_id)
         if user:
@@ -1704,20 +1392,23 @@ class FavorabilityPlugin(Star):
         )
 
     @filter.command("fav-reset")
-    async def cmd_fav_reset(self, event: AstrMessageEvent):
+    @with_session_context(mode="yield_error")
+    async def cmd_fav_reset(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """重置自己在当前会话中的好感度与日统计。"""
         if not self.db:
             yield event.plain_result("好感度系统未初始化")
             return
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            yield event.plain_result(f"会话上下文异常: {exc}")
+        if not session_ctx:
+            yield event.plain_result("会话上下文异常: 缺少会话上下文")
             return
-        sender_id = str(event.get_sender_id() or "").strip()
-        if not sender_id:
-            yield event.plain_result("无法获取你的用户 ID")
-            return
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
+        sender_id = session_ctx.sender_id
         user = self.db.get_user(session_type, session_id, sender_id)
         if not user:
             yield event.plain_result("你还没有被记录在当前会话中哦。")
@@ -1735,7 +1426,13 @@ class FavorabilityPlugin(Star):
         yield event.plain_result(f"已将你的好感度重置为 {initial_level}。")
 
     @filter.command("fav-reset-all")
-    async def cmd_fav_reset_all(self, event: AstrMessageEvent):
+    @with_session_context(mode="yield_error")
+    async def cmd_fav_reset_all(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """管理员重置当前会话全部用户。"""
         if not self.db:
             yield event.plain_result("好感度系统未初始化")
@@ -1743,11 +1440,11 @@ class FavorabilityPlugin(Star):
         if not self._is_admin_event(event):
             yield event.plain_result(self._admin_only_message())
             return
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            yield event.plain_result(f"会话上下文异常: {exc}")
+        if not session_ctx:
+            yield event.plain_result("会话上下文异常: 缺少会话上下文")
             return
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
         now_ts = int(time.time())
         initial_level = self._get_initial_level_for_new_user()
         count = self.db.reset_session_users(
@@ -1760,7 +1457,13 @@ class FavorabilityPlugin(Star):
         yield event.plain_result(f"已重置当前会话 {count} 名用户，好感度={initial_level}。")
 
     @filter.command("fav-export")
-    async def cmd_fav_export(self, event: AstrMessageEvent):
+    @with_session_context(mode="yield_error")
+    async def cmd_fav_export(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """管理员导出数据到文件：fav-export [json|csv] [session|global]。"""
         if not self.db:
             yield event.plain_result("好感度系统未初始化")
@@ -1768,11 +1471,11 @@ class FavorabilityPlugin(Star):
         if not self._is_admin_event(event):
             yield event.plain_result(self._admin_only_message())
             return
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            yield event.plain_result(f"会话上下文异常: {exc}")
+        if not session_ctx:
+            yield event.plain_result("会话上下文异常: 缺少会话上下文")
             return
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
 
         raw = (event.message_str or "").strip()
         parts = raw.split()
@@ -1812,7 +1515,13 @@ class FavorabilityPlugin(Star):
         )
 
     @filter.command("fav-stats")
-    async def cmd_fav_stats(self, event: AstrMessageEvent):
+    @with_session_context(mode="yield_error")
+    async def cmd_fav_stats(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """管理员查看统计：fav-stats [session|global]。"""
         if not self.db:
             yield event.plain_result("好感度系统未初始化")
@@ -1820,11 +1529,11 @@ class FavorabilityPlugin(Star):
         if not self._is_admin_event(event):
             yield event.plain_result(self._admin_only_message())
             return
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            yield event.plain_result(f"会话上下文异常: {exc}")
+        if not session_ctx:
+            yield event.plain_result("会话上下文异常: 缺少会话上下文")
             return
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
         raw = (event.message_str or "").strip()
         parts = raw.split()
         if parts and parts[0].lstrip("/!").lower() == "fav-stats":
@@ -1854,17 +1563,23 @@ class FavorabilityPlugin(Star):
         )
 
     @filter.command("fav-rl")
-    async def cmd_fav_ranking(self, event: AstrMessageEvent):
+    @with_session_context(mode="yield_error")
+    async def cmd_fav_ranking(
+        self,
+        event: AstrMessageEvent,
+        *,
+        session_ctx: Optional[SessionContext] = None,
+    ):
         """查看当前会话的好感度排行榜。"""
         if not self.db:
             yield event.plain_result("好感度系统未初始化")
             return
 
-        try:
-            session_type, session_id, _ = self._resolve_session_context(event)
-        except ValueError as exc:
-            yield event.plain_result(f"会话上下文异常: {exc}")
+        if not session_ctx:
+            yield event.plain_result("会话上下文异常: 缺少会话上下文")
             return
+        session_type = session_ctx.session_type
+        session_id = session_ctx.session_id
 
         raw = (event.message_str or "").strip()
         page = 1
