@@ -45,9 +45,18 @@ git clone https://github.com/SaltedDoubao/astrbot_plugin_favorability_system.git
 |------|------|
 | `fav-init` | 在当前会话中注册自己的好感度记录 |
 | `好感度查询` | 查询自己在当前会话中的好感度和昵称 |
+| `fav-reset` | 重置自己在当前会话中的好感度与当日统计 |
 | `fav-rl [页码]` | 查看当前会话好感度排行榜（每页 10 条） |
 
-### 管理工具
+### 管理命令（仅管理员）
+
+| 命令 | 说明 |
+|------|------|
+| `fav-reset-all` | 重置当前会话全部用户的好感度与当日统计 |
+| `fav-export [json\|csv] [session\|global]` | 导出当前会话或全局数据到文件 |
+| `fav-stats [session\|global]` | 查看当前会话或全局统计 |
+
+### 管理工具（仅管理员，`fav_query` / `fav_get_effect` 除外）
 
 | 工具名 | 说明 |
 |--------|------|
@@ -57,6 +66,10 @@ git clone https://github.com/SaltedDoubao/astrbot_plugin_favorability_system.git
 | `fav_remove_user` | 删除用户及昵称记录 |
 | `fav_add_nickname` | 更新当前昵称（旧昵称沉淀为曾用名） |
 | `fav_remove_nickname` | 删除当前昵称 |
+| `fav_reset` | 重置指定用户好感度与当日统计 |
+| `fav_reset_all` | 重置当前会话全部用户 |
+| `fav_export` | 导出当前会话或全局数据（json/csv） |
+| `fav_stats` | 查看当前会话或全局统计 |
 | `fav_get_effect` | 查询指定数值对应层级效果 |
 
 ## 自动评分规则（V1）
@@ -129,6 +142,16 @@ git clone https://github.com/SaltedDoubao/astrbot_plugin_favorability_system.git
 - 当前 schema：`v3`
 - 继续兼容 `v2 -> v3` 自动迁移
 - 本版本不自动迁移旧路径数据库（`<AstrBot数据目录>/favorability/favorability.db`），如需保留旧数据请手动处理
+
+## 会话隔离策略
+
+- 主键为 `(session_type, session_id, user_id)`。
+- 同一 `user_id` 在不同群/私聊中会维护独立好感度，不跨会话共享。
+
+## 平台兼容说明
+
+- `metadata.yaml` 当前声明平台为 `aiocqhttp`。
+- 代码未对平台做硬编码，理论上兼容其他实现 `AstrMessageEvent` 关键接口的平台。
 
 ## 回滚建议
 
