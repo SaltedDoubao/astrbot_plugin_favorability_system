@@ -1,8 +1,10 @@
 import os
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
 
 SCHEMA_VERSION = 3
 
@@ -38,8 +40,11 @@ class User:
 
 class FavorabilityDB:
     def __init__(self, db_path: str):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.RLock()
         self.conn.execute("PRAGMA foreign_keys = ON")
         try:
             self._init_tables()
@@ -47,47 +52,60 @@ class FavorabilityDB:
             self.conn.close()
             raise
 
+    @contextmanager
+    def immediate_transaction(self) -> Iterator[None]:
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except Exception:
+                self.conn.rollback()
+                raise
+            self.conn.commit()
+
     def _init_tables(self):
-        existing_tables = {
-            row[0]
-            for row in self.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-        core_tables = {"meta", "users", "nicknames"}
+        with self._lock:
+            existing_tables = {
+                row[0]
+                for row in self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            core_tables = {"meta", "users", "nicknames"}
 
-        if not existing_tables.intersection(core_tables):
-            self._create_schema()
-            return
+            if not existing_tables.intersection(core_tables):
+                self._create_schema()
+                return
 
-        if "meta" not in existing_tables:
-            raise SchemaMismatchError(
-                "检测到旧版数据库结构（缺少 meta 表）。本版本不支持自动迁移，请删除旧数据库后重建。"
-            )
+            if "meta" not in existing_tables:
+                raise SchemaMismatchError(
+                    "检测到旧版数据库结构（缺少 meta 表）。本版本不支持自动迁移，请删除旧数据库后重建。"
+                )
 
-        version_row = self.conn.execute(
-            "SELECT value FROM meta WHERE key = 'schema_version'"
-        ).fetchone()
-        if not version_row:
-            raise SchemaMismatchError(
-                "数据库缺少 schema_version。请删除旧数据库后重建。"
-            )
+            version_row = self.conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if not version_row:
+                raise SchemaMismatchError(
+                    "数据库缺少 schema_version。请删除旧数据库后重建。"
+                )
 
-        try:
-            version = int(version_row[0])
-        except (TypeError, ValueError) as exc:
-            raise SchemaMismatchError("schema_version 非法，无法继续启动。") from exc
+            try:
+                version = int(version_row[0])
+            except (TypeError, ValueError) as exc:
+                raise SchemaMismatchError("schema_version 非法，无法继续启动。") from exc
 
-        if version == 2:
-            self._migrate_v2_to_v3()
-            version = 3
+            if version == 2:
+                self._migrate_v2_to_v3()
+                version = 3
 
-        if version != SCHEMA_VERSION:
-            raise SchemaMismatchError(
-                f"数据库 schema_version={version}，当前插件要求 {SCHEMA_VERSION}。请删除旧数据库后重建。"
-            )
+            if version != SCHEMA_VERSION:
+                raise SchemaMismatchError(
+                    f"数据库 schema_version={version}，当前插件要求 {SCHEMA_VERSION}。请删除旧数据库后重建。"
+                )
 
-        self._validate_schema()
+            self._apply_v3_compat_fixes()
+            self._validate_schema()
 
     def _create_schema(self):
         self.conn.executescript(
@@ -124,6 +142,10 @@ class FavorabilityDB:
             CREATE INDEX IF NOT EXISTS idx_nick_lookup
             ON nicknames(session_type, session_id, nickname, is_current);
 
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_nick_current_unique
+            ON nicknames(session_type, session_id, user_id)
+            WHERE is_current = 1;
+
             CREATE TABLE IF NOT EXISTS score_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_type TEXT NOT NULL,
@@ -135,7 +157,9 @@ class FavorabilityDB:
                 final_delta INTEGER NOT NULL,
                 anti_spam_mul REAL NOT NULL,
                 created_at INTEGER NOT NULL,
-                evidence TEXT NOT NULL DEFAULT ''
+                evidence TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (session_type, session_id, user_id)
+                    REFERENCES users(session_type, session_id, user_id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_score_events_user_time
@@ -193,7 +217,9 @@ class FavorabilityDB:
                     final_delta INTEGER NOT NULL,
                     anti_spam_mul REAL NOT NULL,
                     created_at INTEGER NOT NULL,
-                    evidence TEXT NOT NULL DEFAULT ''
+                    evidence TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (session_type, session_id, user_id)
+                        REFERENCES users(session_type, session_id, user_id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_score_events_user_time
@@ -219,10 +245,186 @@ class FavorabilityDB:
             self.conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '3')"
             )
+            self._apply_v3_compat_fixes()
             self.conn.commit()
         except Exception as exc:
             self.conn.rollback()
             raise SchemaMismatchError(f"v2 -> v3 迁移失败: {exc}") from exc
+
+    def _apply_v3_compat_fixes(self):
+        self._normalize_current_nicknames()
+        self.conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_nick_current_unique
+            ON nicknames(session_type, session_id, user_id)
+            WHERE is_current = 1
+            """
+        )
+        if not self._has_users_foreign_key("nicknames"):
+            self._rebuild_nicknames_with_fk()
+        if not self._has_users_foreign_key("score_events"):
+            self._rebuild_score_events_with_fk()
+
+    def _normalize_current_nicknames(self):
+        duplicate_groups = self.conn.execute(
+            """
+            SELECT session_type, session_id, user_id
+            FROM nicknames
+            WHERE is_current = 1
+            GROUP BY session_type, session_id, user_id
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for session_type, session_id, user_id in duplicate_groups:
+            rowids = self.conn.execute(
+                """
+                SELECT rowid
+                FROM nicknames
+                WHERE session_type = ?
+                  AND session_id = ?
+                  AND user_id = ?
+                  AND is_current = 1
+                ORDER BY created_at DESC, rowid DESC
+                """,
+                (session_type, session_id, user_id),
+            ).fetchall()
+            for row in rowids[1:]:
+                self.conn.execute(
+                    "UPDATE nicknames SET is_current = 0 WHERE rowid = ?", (row[0],)
+                )
+
+    def _rebuild_nicknames_with_fk(self):
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.conn.execute(
+                """
+                DELETE FROM nicknames
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM users
+                    WHERE users.session_type = nicknames.session_type
+                      AND users.session_id = nicknames.session_id
+                      AND users.user_id = nicknames.user_id
+                )
+                """
+            )
+            self.conn.execute("ALTER TABLE nicknames RENAME TO nicknames_old")
+            self.conn.execute(
+                """
+                CREATE TABLE nicknames (
+                    session_type TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    nickname TEXT NOT NULL,
+                    is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (session_type, session_id, user_id)
+                        REFERENCES users(session_type, session_id, user_id) ON DELETE CASCADE,
+                    UNIQUE(session_type, session_id, user_id, nickname)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO nicknames
+                (session_type, session_id, user_id, nickname, is_current, created_at)
+                SELECT session_type, session_id, user_id, nickname, is_current, created_at
+                FROM nicknames_old
+                ORDER BY created_at ASC, rowid ASC
+                """
+            )
+            self.conn.execute("DROP TABLE nicknames_old")
+            self.conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_nick_lookup
+                ON nicknames(session_type, session_id, nickname, is_current);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_nick_current_unique
+                ON nicknames(session_type, session_id, user_id)
+                WHERE is_current = 1;
+                """
+            )
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def _rebuild_score_events_with_fk(self):
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.conn.execute(
+                """
+                DELETE FROM score_events
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM users
+                    WHERE users.session_type = score_events.session_type
+                      AND users.session_id = score_events.session_id
+                      AND users.user_id = score_events.user_id
+                )
+                """
+            )
+            self.conn.execute("ALTER TABLE score_events RENAME TO score_events_old")
+            self.conn.execute(
+                """
+                CREATE TABLE score_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_type TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    interaction_type TEXT NOT NULL,
+                    intensity INTEGER NOT NULL,
+                    raw_delta INTEGER NOT NULL,
+                    final_delta INTEGER NOT NULL,
+                    anti_spam_mul REAL NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    evidence TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (session_type, session_id, user_id)
+                        REFERENCES users(session_type, session_id, user_id) ON DELETE CASCADE
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                INSERT INTO score_events (
+                    id,
+                    session_type,
+                    session_id,
+                    user_id,
+                    interaction_type,
+                    intensity,
+                    raw_delta,
+                    final_delta,
+                    anti_spam_mul,
+                    created_at,
+                    evidence
+                )
+                SELECT
+                    id,
+                    session_type,
+                    session_id,
+                    user_id,
+                    interaction_type,
+                    intensity,
+                    raw_delta,
+                    final_delta,
+                    anti_spam_mul,
+                    created_at,
+                    evidence
+                FROM score_events_old
+                ORDER BY id ASC
+                """
+            )
+            self.conn.execute("DROP TABLE score_events_old")
+            self.conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_score_events_user_time
+                ON score_events(session_type, session_id, user_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_score_events_type_time
+                ON score_events(session_type, session_id, user_id, interaction_type, created_at);
+                """
+            )
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
 
     def _validate_schema(self):
         required_tables = {"meta", "users", "nicknames", "score_events"}
@@ -287,6 +489,19 @@ class FavorabilityDB:
                 "nicknames 索引不符合要求。请删除旧数据库后重建。"
             )
 
+        if not self._has_index(
+            "nicknames",
+            "idx_nick_current_unique",
+            ["session_type", "session_id", "user_id"],
+            require_unique=True,
+        ):
+            raise SchemaMismatchError(
+                "nicknames 索引 idx_nick_current_unique 缺失或不匹配。"
+            )
+
+        if not self._has_users_foreign_key("nicknames"):
+            raise SchemaMismatchError("nicknames 外键约束不符合要求。")
+
         score_columns = self._get_columns("score_events")
         required_score_columns = {
             "id",
@@ -330,6 +545,9 @@ class FavorabilityDB:
                 "score_events 索引 idx_score_events_type_time 缺失或不匹配。"
             )
 
+        if not self._has_users_foreign_key("score_events"):
+            raise SchemaMismatchError("score_events 外键约束不符合要求。")
+
     def _get_columns(self, table_name: str) -> set[str]:
         rows = self.conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
         return {row[1] for row in rows}
@@ -357,11 +575,22 @@ class FavorabilityDB:
         return False
 
     def _has_index(
-        self, table_name: str, index_name: str, expected_columns: list[str]
+        self,
+        table_name: str,
+        index_name: str,
+        expected_columns: list[str],
+        *,
+        require_unique: bool = False,
     ) -> bool:
         index_rows = self.conn.execute(f"PRAGMA index_list('{table_name}')").fetchall()
-        names = {row[1] for row in index_rows}
-        if index_name not in names:
+        target_row = None
+        for row in index_rows:
+            if row[1] == index_name:
+                target_row = row
+                break
+        if target_row is None:
+            return False
+        if require_unique and not bool(target_row[2]):
             return False
         index_columns = [
             info[2]
@@ -370,6 +599,28 @@ class FavorabilityDB:
             ).fetchall()
         ]
         return index_columns == expected_columns
+
+    def _has_users_foreign_key(self, table_name: str) -> bool:
+        rows = self.conn.execute(f"PRAGMA foreign_key_list('{table_name}')").fetchall()
+        if not rows:
+            return False
+        groups: dict[int, list[tuple]] = {}
+        for row in rows:
+            groups.setdefault(int(row[0]), []).append(row)
+        for group_rows in groups.values():
+            ordered = sorted(group_rows, key=lambda r: int(r[1]))
+            ref_table = ordered[0][2]
+            from_cols = [r[3] for r in ordered]
+            to_cols = [r[4] for r in ordered]
+            on_delete = ordered[0][6]
+            if (
+                ref_table == "users"
+                and from_cols == ["session_type", "session_id", "user_id"]
+                and to_cols == ["session_type", "session_id", "user_id"]
+                and str(on_delete).upper() == "CASCADE"
+            ):
+                return True
+        return False
 
     def add_user(
         self,
@@ -381,14 +632,79 @@ class FavorabilityDB:
         daily_pos_gain: int = 0,
         daily_neg_gain: int = 0,
         daily_bucket: Optional[str] = None,
+        *,
+        commit: bool = True,
     ) -> bool:
         """添加新用户，若已存在返回 False。"""
         if daily_bucket is None:
             daily_bucket = time.strftime("%Y-%m-%d", time.localtime())
-        try:
-            self.conn.execute(
+        with self._lock:
+            try:
+                self.conn.execute(
+                    """
+                    INSERT INTO users (
+                        session_type,
+                        session_id,
+                        user_id,
+                        level,
+                        last_interaction_at,
+                        daily_pos_gain,
+                        daily_neg_gain,
+                        daily_bucket
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_type,
+                        session_id,
+                        user_id,
+                        level,
+                        last_interaction_at,
+                        daily_pos_gain,
+                        daily_neg_gain,
+                        daily_bucket,
+                    ),
+                )
+                if commit:
+                    self.conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                if commit:
+                    self.conn.rollback()
+                return False
+
+    def remove_user(self, session_type: str, session_id: str, user_id: str) -> bool:
+        """删除用户及其所有昵称（CASCADE）。"""
+        with self._lock:
+            try:
+                self.conn.execute(
+                    """
+                    DELETE FROM score_events
+                    WHERE session_type = ? AND session_id = ? AND user_id = ?
+                    """,
+                    (session_type, session_id, user_id),
+                )
+                cur = self.conn.execute(
+                    """
+                    DELETE FROM users
+                    WHERE session_type = ? AND session_id = ? AND user_id = ?
+                    """,
+                    (session_type, session_id, user_id),
+                )
+                self.conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_user(
+        self, session_type: str, session_id: str, user_id: str
+    ) -> Optional[User]:
+        """通过会话和用户 ID 查询用户。"""
+        with self._lock:
+            row = self.conn.execute(
                 """
-                INSERT INTO users (
+                SELECT
                     session_type,
                     session_id,
                     user_id,
@@ -397,75 +713,29 @@ class FavorabilityDB:
                     daily_pos_gain,
                     daily_neg_gain,
                     daily_bucket
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                FROM users
+                WHERE session_type = ? AND session_id = ? AND user_id = ?
                 """,
-                (
-                    session_type,
-                    session_id,
-                    user_id,
-                    level,
-                    last_interaction_at,
-                    daily_pos_gain,
-                    daily_neg_gain,
-                    daily_bucket,
+                (session_type, session_id, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            return User(
+                session_type=row[0],
+                session_id=row[1],
+                user_id=row[2],
+                level=row[3],
+                current_nickname=self.get_current_nickname(
+                    session_type, session_id, user_id
                 ),
+                historical_nicknames=self.get_historical_nicknames(
+                    session_type, session_id, user_id
+                ),
+                last_interaction_at=row[4],
+                daily_pos_gain=row[5] or 0,
+                daily_neg_gain=row[6] or 0,
+                daily_bucket=row[7],
             )
-            self.conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-    def remove_user(self, session_type: str, session_id: str, user_id: str) -> bool:
-        """删除用户及其所有昵称（CASCADE）。"""
-        cur = self.conn.execute(
-            """
-            DELETE FROM users
-            WHERE session_type = ? AND session_id = ? AND user_id = ?
-            """,
-            (session_type, session_id, user_id),
-        )
-        self.conn.commit()
-        return cur.rowcount > 0
-
-    def get_user(
-        self, session_type: str, session_id: str, user_id: str
-    ) -> Optional[User]:
-        """通过会话和用户 ID 查询用户。"""
-        row = self.conn.execute(
-            """
-            SELECT
-                session_type,
-                session_id,
-                user_id,
-                level,
-                last_interaction_at,
-                daily_pos_gain,
-                daily_neg_gain,
-                daily_bucket
-            FROM users
-            WHERE session_type = ? AND session_id = ? AND user_id = ?
-            """,
-            (session_type, session_id, user_id),
-        ).fetchone()
-        if not row:
-            return None
-        return User(
-            session_type=row[0],
-            session_id=row[1],
-            user_id=row[2],
-            level=row[3],
-            current_nickname=self.get_current_nickname(
-                session_type, session_id, user_id
-            ),
-            historical_nicknames=self.get_historical_nicknames(
-                session_type, session_id, user_id
-            ),
-            last_interaction_at=row[4],
-            daily_pos_gain=row[5] or 0,
-            daily_neg_gain=row[6] or 0,
-            daily_bucket=row[7],
-        )
 
     def get_ranking(
         self,
@@ -475,67 +745,69 @@ class FavorabilityDB:
         offset: int,
     ) -> tuple[list[User], int]:
         """按好感度降序返回分页用户列表和总数。"""
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM users WHERE session_type = ? AND session_id = ?",
-            (session_type, session_id),
-        ).fetchone()[0]
+        with self._lock:
+            total = self.conn.execute(
+                "SELECT COUNT(*) FROM users WHERE session_type = ? AND session_id = ?",
+                (session_type, session_id),
+            ).fetchone()[0]
 
-        rows = self.conn.execute(
-            """
-            SELECT u.user_id, u.level, n.nickname
-            FROM users u
-            LEFT JOIN nicknames n
-              ON u.session_type = n.session_type
-             AND u.session_id = n.session_id
-             AND u.user_id = n.user_id
-             AND n.is_current = 1
-            WHERE u.session_type = ? AND u.session_id = ?
-            ORDER BY u.level DESC, u.user_id ASC
-            LIMIT ? OFFSET ?
-            """,
-            (session_type, session_id, limit, offset),
-        ).fetchall()
+            rows = self.conn.execute(
+                """
+                SELECT u.user_id, u.level, n.nickname
+                FROM users u
+                LEFT JOIN nicknames n
+                  ON u.session_type = n.session_type
+                 AND u.session_id = n.session_id
+                 AND u.user_id = n.user_id
+                 AND n.is_current = 1
+                WHERE u.session_type = ? AND u.session_id = ?
+                ORDER BY u.level DESC, u.user_id ASC
+                LIMIT ? OFFSET ?
+                """,
+                (session_type, session_id, limit, offset),
+            ).fetchall()
 
-        users = [
-            User(
-                session_type=session_type,
-                session_id=session_id,
-                user_id=row[0],
-                level=row[1],
-                current_nickname=row[2],
-            )
-            for row in rows
-        ]
-        return users, total
+            users = [
+                User(
+                    session_type=session_type,
+                    session_id=session_id,
+                    user_id=row[0],
+                    level=row[1],
+                    current_nickname=row[2],
+                )
+                for row in rows
+            ]
+            return users, total
 
     def find_user_by_current_nickname(
         self, session_type: str, session_id: str, nickname: str
     ) -> Optional[User]:
         """通过当前昵称查找用户（仅当前会话）。"""
-        rows = self.conn.execute(
-            """
-            SELECT u.user_id
-            FROM users u
-            JOIN nicknames n
-              ON u.session_type = n.session_type
-             AND u.session_id = n.session_id
-             AND u.user_id = n.user_id
-            WHERE u.session_type = ?
-              AND u.session_id = ?
-              AND n.nickname = ?
-              AND n.is_current = 1
-            """,
-            (session_type, session_id, nickname),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT u.user_id
+                FROM users u
+                JOIN nicknames n
+                  ON u.session_type = n.session_type
+                 AND u.session_id = n.session_id
+                 AND u.user_id = n.user_id
+                WHERE u.session_type = ?
+                  AND u.session_id = ?
+                  AND n.nickname = ?
+                  AND n.is_current = 1
+                """,
+                (session_type, session_id, nickname),
+            ).fetchall()
 
-        if not rows:
-            return None
+            if not rows:
+                return None
 
-        if len(rows) > 1:
-            user_ids = sorted({row[0] for row in rows})
-            raise NicknameAmbiguousError(nickname=nickname, user_ids=user_ids)
+            if len(rows) > 1:
+                user_ids = sorted({row[0] for row in rows})
+                raise NicknameAmbiguousError(nickname=nickname, user_ids=user_ids)
 
-        return self.get_user(session_type, session_id, rows[0][0])
+            return self.get_user(session_type, session_id, rows[0][0])
 
     def update_level(
         self,
@@ -548,6 +820,7 @@ class FavorabilityDB:
         daily_pos_gain: Optional[int] = None,
         daily_neg_gain: Optional[int] = None,
         daily_bucket: Optional[str] = None,
+        commit: bool = True,
     ) -> bool:
         """更新好感度等级，可选更新行为统计字段。"""
         sets = ["level = ?"]
@@ -567,126 +840,147 @@ class FavorabilityDB:
             params.append(daily_bucket)
 
         params.extend([session_type, session_id, user_id])
-        cur = self.conn.execute(
-            f"""
-            UPDATE users
-            SET {', '.join(sets)}
-            WHERE session_type = ? AND session_id = ? AND user_id = ?
-            """,
-            tuple(params),
-        )
-        self.conn.commit()
-        return cur.rowcount > 0
+        with self._lock:
+            cur = self.conn.execute(
+                f"""
+                UPDATE users
+                SET {', '.join(sets)}
+                WHERE session_type = ? AND session_id = ? AND user_id = ?
+                """,
+                tuple(params),
+            )
+            if commit:
+                self.conn.commit()
+            return cur.rowcount > 0
 
     def upsert_current_nickname(
-        self, session_type: str, session_id: str, user_id: str, nickname: str
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        nickname: str,
+        *,
+        commit: bool = True,
     ) -> bool:
         """设置当前昵称，旧当前昵称会转为曾用名。"""
         nickname = nickname.strip()
         if not nickname:
             return False
 
-        try:
-            now = int(time.time())
-            self.conn.execute(
-                """
-                UPDATE nicknames
-                SET is_current = 0
-                WHERE session_type = ? AND session_id = ? AND user_id = ? AND is_current = 1
-                """,
-                (session_type, session_id, user_id),
-            )
-
-            existed = self.conn.execute(
-                """
-                SELECT 1
-                FROM nicknames
-                WHERE session_type = ? AND session_id = ? AND user_id = ? AND nickname = ?
-                """,
-                (session_type, session_id, user_id, nickname),
-            ).fetchone()
-
-            if existed:
+        with self._lock:
+            try:
+                now = int(time.time())
                 self.conn.execute(
                     """
                     UPDATE nicknames
-                    SET is_current = 1
+                    SET is_current = 0
+                    WHERE session_type = ? AND session_id = ? AND user_id = ? AND is_current = 1
+                    """,
+                    (session_type, session_id, user_id),
+                )
+
+                existed = self.conn.execute(
+                    """
+                    SELECT 1
+                    FROM nicknames
                     WHERE session_type = ? AND session_id = ? AND user_id = ? AND nickname = ?
                     """,
                     (session_type, session_id, user_id, nickname),
-                )
-            else:
-                self.conn.execute(
-                    """
-                    INSERT INTO nicknames
-                    (session_type, session_id, user_id, nickname, is_current, created_at)
-                    VALUES (?, ?, ?, ?, 1, ?)
-                    """,
-                    (session_type, session_id, user_id, nickname, now),
-                )
+                ).fetchone()
 
-            self.conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            self.conn.rollback()
-            return False
+                if existed:
+                    self.conn.execute(
+                        """
+                        UPDATE nicknames
+                        SET is_current = 1
+                        WHERE session_type = ? AND session_id = ? AND user_id = ? AND nickname = ?
+                        """,
+                        (session_type, session_id, user_id, nickname),
+                    )
+                else:
+                    self.conn.execute(
+                        """
+                        INSERT INTO nicknames
+                        (session_type, session_id, user_id, nickname, is_current, created_at)
+                        VALUES (?, ?, ?, ?, 1, ?)
+                        """,
+                        (session_type, session_id, user_id, nickname, now),
+                    )
+
+                if commit:
+                    self.conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                if commit:
+                    self.conn.rollback()
+                return False
 
     def remove_current_nickname(
-        self, session_type: str, session_id: str, user_id: str, nickname: str
+        self,
+        session_type: str,
+        session_id: str,
+        user_id: str,
+        nickname: str,
+        *,
+        commit: bool = True,
     ) -> bool:
         """删除当前昵称（不会删除其他曾用名）。"""
-        cur = self.conn.execute(
-            """
-            DELETE FROM nicknames
-            WHERE session_type = ?
-              AND session_id = ?
-              AND user_id = ?
-              AND nickname = ?
-              AND is_current = 1
-            """,
-            (session_type, session_id, user_id, nickname),
-        )
-        self.conn.commit()
-        return cur.rowcount > 0
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                DELETE FROM nicknames
+                WHERE session_type = ?
+                  AND session_id = ?
+                  AND user_id = ?
+                  AND nickname = ?
+                  AND is_current = 1
+                """,
+                (session_type, session_id, user_id, nickname),
+            )
+            if commit:
+                self.conn.commit()
+            return cur.rowcount > 0
 
     def get_current_nickname(
         self, session_type: str, session_id: str, user_id: str
     ) -> Optional[str]:
         """获取用户当前昵称。"""
-        row = self.conn.execute(
-            """
-            SELECT nickname
-            FROM nicknames
-            WHERE session_type = ?
-              AND session_id = ?
-              AND user_id = ?
-              AND is_current = 1
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (session_type, session_id, user_id),
-        ).fetchone()
-        if not row:
-            return None
-        return row[0]
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT nickname
+                FROM nicknames
+                WHERE session_type = ?
+                  AND session_id = ?
+                  AND user_id = ?
+                  AND is_current = 1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_type, session_id, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            return row[0]
 
     def get_historical_nicknames(
         self, session_type: str, session_id: str, user_id: str
     ) -> list[str]:
         """获取用户曾用名（不含当前昵称）。"""
-        rows = self.conn.execute(
-            """
-            SELECT nickname
-            FROM nicknames
-            WHERE session_type = ?
-              AND session_id = ?
-              AND user_id = ?
-              AND is_current = 0
-            ORDER BY created_at DESC
-            """,
-            (session_type, session_id, user_id),
-        ).fetchall()
-        return [r[0] for r in rows]
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT nickname
+                FROM nicknames
+                WHERE session_type = ?
+                  AND session_id = ?
+                  AND user_id = ?
+                  AND is_current = 0
+                ORDER BY created_at DESC
+                """,
+                (session_type, session_id, user_id),
+            ).fetchall()
+            return [r[0] for r in rows]
 
     def ensure_current_nickname(
         self, session_type: str, session_id: str, user_id: str, fallback_nickname: str
@@ -711,37 +1005,41 @@ class FavorabilityDB:
         anti_spam_mul: float,
         created_at: int,
         evidence: str,
+        *,
+        commit: bool = True,
     ):
-        self.conn.execute(
-            """
-            INSERT INTO score_events (
-                session_type,
-                session_id,
-                user_id,
-                interaction_type,
-                intensity,
-                raw_delta,
-                final_delta,
-                anti_spam_mul,
-                created_at,
-                evidence
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO score_events (
+                    session_type,
+                    session_id,
+                    user_id,
+                    interaction_type,
+                    intensity,
+                    raw_delta,
+                    final_delta,
+                    anti_spam_mul,
+                    created_at,
+                    evidence
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_type,
+                    session_id,
+                    user_id,
+                    interaction_type,
+                    intensity,
+                    raw_delta,
+                    final_delta,
+                    anti_spam_mul,
+                    created_at,
+                    evidence,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                session_type,
-                session_id,
-                user_id,
-                interaction_type,
-                intensity,
-                raw_delta,
-                final_delta,
-                anti_spam_mul,
-                created_at,
-                evidence,
-            ),
-        )
-        self.conn.commit()
+            if commit:
+                self.conn.commit()
 
     def count_positive_events_by_type_since(
         self,
@@ -751,20 +1049,21 @@ class FavorabilityDB:
         interaction_type: str,
         since_ts: int,
     ) -> int:
-        row = self.conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM score_events
-            WHERE session_type = ?
-              AND session_id = ?
-              AND user_id = ?
-              AND interaction_type = ?
-              AND final_delta > 0
-              AND created_at >= ?
-            """,
-            (session_type, session_id, user_id, interaction_type, since_ts),
-        ).fetchone()
-        return int(row[0] if row and row[0] is not None else 0)
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM score_events
+                WHERE session_type = ?
+                  AND session_id = ?
+                  AND user_id = ?
+                  AND interaction_type = ?
+                  AND final_delta > 0
+                  AND created_at >= ?
+                """,
+                (session_type, session_id, user_id, interaction_type, since_ts),
+            ).fetchone()
+            return int(row[0] if row and row[0] is not None else 0)
 
     def sum_positive_delta_since(
         self,
@@ -773,19 +1072,21 @@ class FavorabilityDB:
         user_id: str,
         since_ts: int,
     ) -> int:
-        row = self.conn.execute(
-            """
-            SELECT COALESCE(SUM(final_delta), 0)
-            FROM score_events
-            WHERE session_type = ?
-              AND session_id = ?
-              AND user_id = ?
-              AND final_delta > 0
-              AND created_at >= ?
-            """,
-            (session_type, session_id, user_id, since_ts),
-        ).fetchone()
-        return int(row[0] if row and row[0] is not None else 0)
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT COALESCE(SUM(final_delta), 0)
+                FROM score_events
+                WHERE session_type = ?
+                  AND session_id = ?
+                  AND user_id = ?
+                  AND final_delta > 0
+                  AND created_at >= ?
+                """,
+                (session_type, session_id, user_id, since_ts),
+            ).fetchone()
+            return int(row[0] if row and row[0] is not None else 0)
 
     def close(self):
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
