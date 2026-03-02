@@ -99,6 +99,7 @@ git clone https://github.com/SaltedDoubao/astrbot_plugin_favorability_system.git
 |--------|------|--------|------|
 | `min_level` | int | -100 | 下限（固定要求 -100） |
 | `max_level` | int | 100 | 上限（固定要求 100） |
+| `initial_level` | int | 0 | 新用户注册时的初始好感度（需在 -100~100 范围内） |
 | `decay_enabled` | bool | false | 是否启用长期不互动衰减 |
 | `idle_days_threshold` | int | 14 | 衰减触发阈值（天） |
 | `decay_per_day` | int | 1 | 超阈值后每天向 0 回归点数 |

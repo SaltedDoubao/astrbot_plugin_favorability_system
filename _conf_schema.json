@@ -9,6 +9,11 @@
     "description": "好感度等级的最大值（当前版本固定为 100）",
     "default": 100
   },
+  "initial_level": {
+    "type": "int",
+    "description": "新用户注册时的初始好感度（需在 min_level~max_level 范围内）",
+    "default": 0
+  },
   "decay_enabled": {
     "type": "bool",
     "description": "是否启用长期不互动时的惰性衰减（默认关闭）",

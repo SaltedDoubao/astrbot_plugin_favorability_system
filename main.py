@@ -48,6 +48,7 @@ class FavorabilityPlugin(Star):
         self.db: Optional[FavorabilityDB] = None
         self.min_level: int = 0
         self.max_level: int = 0
+        self.initial_level: int = 0
         self.tiers: list[dict] = []
         self.decay_enabled: bool = False
         self.idle_days_threshold: int = 14
@@ -58,6 +59,12 @@ class FavorabilityPlugin(Star):
             self.min_level = self._parse_required_int("min_level")
             self.max_level = self._parse_required_int("max_level")
             self._validate_level_bounds()
+            self.initial_level = self._parse_optional_int(
+                "initial_level",
+                0,
+                min_value=self.min_level,
+                max_value=self.max_level,
+            )
 
             tiers = self._parse_required_tiers("tiers")
             self.tiers = self._validate_and_normalize_tiers(tiers)
@@ -95,7 +102,13 @@ class FavorabilityPlugin(Star):
         except (TypeError, ValueError) as exc:
             raise ValueError(f"配置项 {key} 不是合法整数: {raw}") from exc
 
-    def _parse_optional_int(self, key: str, default: int, min_value: int = 0) -> int:
+    def _parse_optional_int(
+        self,
+        key: str,
+        default: int,
+        min_value: int = 0,
+        max_value: Optional[int] = None,
+    ) -> int:
         if key not in self._config:
             return default
         raw = self._config.get(key)
@@ -107,6 +120,8 @@ class FavorabilityPlugin(Star):
             raise ValueError(f"配置项 {key} 不是合法整数: {raw}") from exc
         if value < min_value:
             raise ValueError(f"配置项 {key} 不能小于 {min_value}")
+        if max_value is not None and value > max_value:
+            raise ValueError(f"配置项 {key} 不能大于 {max_value}")
         return value
 
     def _parse_optional_bool(self, key: str, default: bool) -> bool:
@@ -745,7 +760,7 @@ class FavorabilityPlugin(Star):
         except ValueError as exc:
             return f"会话上下文异常: {exc}"
 
-        initial_level = self._clamp_level(0)
+        initial_level = self.initial_level
         normalized_nickname = str(nickname or "").strip() or user_id
 
         if not self.db.add_user(session_type, session_id, user_id, initial_level):
@@ -941,7 +956,7 @@ class FavorabilityPlugin(Star):
             yield event.plain_result(f"你已经注册过了，当前好感度: {user.level}")
             return
 
-        initial_level = self._clamp_level(0)
+        initial_level = self.initial_level
         nickname = self._normalize_nickname(sender_name, sender_id)
         display_nickname = nickname or sender_id
 
