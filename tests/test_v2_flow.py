@@ -14,7 +14,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _install_astrbot_stubs(data_path: str | None = None):
+def _install_astrbot_stubs(
+    data_path: str | None = None,
+    star_tools_data_dir: str | None = None,
+):
     astrbot = types.ModuleType("astrbot")
     api = types.ModuleType("astrbot.api")
     event_mod = types.ModuleType("astrbot.api.event")
@@ -62,6 +65,10 @@ def _install_astrbot_stubs(data_path: str | None = None):
     star_mod.Context = _Context
     star_mod.Star = _Star
     star_mod.register = _identity_decorator
+    if star_tools_data_dir is not None:
+        star_mod.StarTools = types.SimpleNamespace(
+            get_data_dir=lambda: Path(star_tools_data_dir)
+        )
 
     sys.modules["astrbot"] = astrbot
     sys.modules["astrbot.api"] = api
@@ -86,8 +93,14 @@ def _install_astrbot_stubs(data_path: str | None = None):
         sys.modules.pop("astrbot.core.utils.astrbot_path", None)
 
 
-def _load_plugin_module(data_path: str | None = None):
-    _install_astrbot_stubs(data_path=data_path)
+def _load_plugin_module(
+    data_path: str | None = None,
+    star_tools_data_dir: str | None = None,
+):
+    _install_astrbot_stubs(
+        data_path=data_path,
+        star_tools_data_dir=star_tools_data_dir,
+    )
     package_name = "favorability_testpkg"
     package = types.ModuleType(package_name)
     package.__path__ = [str(ROOT)]
@@ -612,6 +625,33 @@ class FavorabilityV2FlowTests(unittest.TestCase):
                 "astrbot_plugin_favorability_system",
                 "favorability.db",
             )
+            self.assertEqual(
+                os.path.normcase(os.path.normpath(db_path)),
+                os.path.normcase(os.path.normpath(expected_db_path)),
+            )
+            plugin.db.close()
+
+
+    def test_initialize_prefers_star_tools_data_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            main_mod, _ = _load_plugin_module(star_tools_data_dir=td)
+            config = {
+                "min_level": {"value": -100},
+                "max_level": {"value": 100},
+                "tiers": {
+                    "value": json.dumps(
+                        [
+                            {"name": "中立", "min": -100, "max": 100, "effect": "中立"}
+                        ],
+                        ensure_ascii=False,
+                    )
+                },
+            }
+            plugin = main_mod.FavorabilityPlugin(None, config)
+            asyncio.run(plugin.initialize())
+
+            db_path = plugin.db.conn.execute("PRAGMA database_list").fetchone()[2]
+            expected_db_path = os.path.join(td, "favorability.db")
             self.assertEqual(
                 os.path.normcase(os.path.normpath(db_path)),
                 os.path.normcase(os.path.normpath(expected_db_path)),
