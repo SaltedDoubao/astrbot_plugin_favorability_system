@@ -5,6 +5,7 @@ import math
 import os
 import time
 import zipfile
+import astrbot.api.star as star_api
 from typing import Any, Optional
 
 from astrbot.api import llm_tool, logger
@@ -132,22 +133,26 @@ class FavorabilityPlugin(Star):
                 min_value=0,
             )
 
-            try:
-                from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+            star_tools = getattr(star_api, "StarTools", None)
+            if star_tools and hasattr(star_tools, "get_data_dir"):
+                data_dir = str(star_tools.get_data_dir())
+            else:
+                try:
+                    from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-                data_dir = os.path.join(
-                    get_astrbot_data_path(),
-                    "data",
-                    "plugin_data",
-                    "astrbot_plugin_favorability_system",
-                )
-            except ImportError:
-                data_dir = os.path.join(
-                    os.path.dirname(__file__),
-                    "data",
-                    "plugin_data",
-                    "astrbot_plugin_favorability_system",
-                )
+                    data_dir = os.path.join(
+                        get_astrbot_data_path(),
+                        "data",
+                        "plugin_data",
+                        "astrbot_plugin_favorability_system",
+                    )
+                except ImportError:
+                    data_dir = os.path.join(
+                        os.path.dirname(__file__),
+                        "data",
+                        "plugin_data",
+                        "astrbot_plugin_favorability_system",
+                    )
 
             self.data_dir = data_dir
             db_path = os.path.join(data_dir, "favorability.db")
