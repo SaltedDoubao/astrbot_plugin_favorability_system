@@ -42,6 +42,13 @@ def resolve_session_context(event: Any) -> SessionContext:
 
 def with_session_context(mode: Mode = "silent") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        sig = inspect.signature(func)
+        params = list(sig.parameters.values())
+        has_extra_positional = len(params) > 2 and params[2].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.POSITIONAL_ONLY,
+        )
+
         if inspect.isasyncgenfunction(func):
 
             @wraps(func)
@@ -57,8 +64,12 @@ def with_session_context(mode: Mode = "silent") -> Callable[[Callable[..., Any]]
                 call_kwargs = dict(kwargs)
                 if call_kwargs.get("session_ctx") is None:
                     call_kwargs["session_ctx"] = session_ctx
-                async for item in func(self, event, *args, **call_kwargs):
-                    yield item
+                if has_extra_positional:
+                    async for item in func(self, event, *args, **call_kwargs):
+                        yield item
+                else:
+                    async for item in func(self, event, **call_kwargs):
+                        yield item
 
             return asyncgen_wrapper
 
@@ -73,7 +84,10 @@ def with_session_context(mode: Mode = "silent") -> Callable[[Callable[..., Any]]
             call_kwargs = dict(kwargs)
             if call_kwargs.get("session_ctx") is None:
                 call_kwargs["session_ctx"] = session_ctx
-            return await func(self, event, *args, **call_kwargs)
+            if has_extra_positional:
+                return await func(self, event, *args, **call_kwargs)
+            else:
+                return await func(self, event, **call_kwargs)
 
         return async_wrapper
 
