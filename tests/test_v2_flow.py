@@ -380,6 +380,21 @@ class FavorabilityV2FlowTests(unittest.TestCase):
         results = asyncio.run(self._collect(self.plugin.cmd_fav_ranking(bad_event)))
         self.assertTrue(any("会话上下文异常" in msg for msg in results))
 
+    def test_session_context_decorator_allows_preinjected_session_ctx(self):
+        self.plugin.db.add_user("group", "100", "u1", 10)
+        event = _FakeEvent(sender_id="u1", group_id="100", message_str="fav-rl")
+        session_ctx = self.main_mod.SessionContext(
+            session_type="group",
+            session_id="100",
+            sender_name="测试用户",
+            sender_id="u1",
+        )
+
+        results = asyncio.run(
+            self._collect(self.plugin.cmd_fav_ranking(event, session_ctx=session_ctx))
+        )
+        self.assertTrue(any("好感度排行" in msg for msg in results))
+
     def test_style_prompt_uses_effect_not_tier_name(self):
         self.plugin.tiers = [
             {"name": "A", "min": -100, "max": -1, "effect": "保持距离"},

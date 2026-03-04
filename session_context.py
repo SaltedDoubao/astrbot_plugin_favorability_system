@@ -54,9 +54,10 @@ def with_session_context(mode: Mode = "silent") -> Callable[[Callable[..., Any]]
                     if mode == "yield_error":
                         yield event.plain_result(f"会话上下文异常: {exc}")
                     return
-                async for item in func(
-                    self, event, *args, session_ctx=session_ctx, **kwargs
-                ):
+                call_kwargs = dict(kwargs)
+                if call_kwargs.get("session_ctx") is None:
+                    call_kwargs["session_ctx"] = session_ctx
+                async for item in func(self, event, *args, **call_kwargs):
                     yield item
 
             return asyncgen_wrapper
@@ -69,7 +70,10 @@ def with_session_context(mode: Mode = "silent") -> Callable[[Callable[..., Any]]
                 if mode == "return_error":
                     return f"会话上下文异常: {exc}"
                 return None
-            return await func(self, event, *args, session_ctx=session_ctx, **kwargs)
+            call_kwargs = dict(kwargs)
+            if call_kwargs.get("session_ctx") is None:
+                call_kwargs["session_ctx"] = session_ctx
+            return await func(self, event, *args, **call_kwargs)
 
         return async_wrapper
 
