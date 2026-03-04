@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import importlib.util
 import json
 import os
@@ -382,7 +383,7 @@ class FavorabilityV2FlowTests(unittest.TestCase):
 
     def test_session_context_decorator_allows_preinjected_session_ctx(self):
         self.plugin.db.add_user("group", "100", "u1", 10)
-        event = _FakeEvent(sender_id="u1", group_id="100", message_str="fav-rl")
+        event = _FakeEvent(sender_id="u1", group_id="999", message_str="fav-rl")
         session_ctx = self.main_mod.SessionContext(
             session_type="group",
             session_id="100",
@@ -394,6 +395,18 @@ class FavorabilityV2FlowTests(unittest.TestCase):
             self._collect(self.plugin.cmd_fav_ranking(event, session_ctx=session_ctx))
         )
         self.assertTrue(any("好感度排行" in msg for msg in results))
+        self.assertFalse(any("当前会话还没有好感度记录" in msg for msg in results))
+
+    def test_session_context_decorator_ignores_invalid_preinjected_session_ctx(self):
+        self.plugin.db.add_user("group", "100", "u1", 10)
+        event = _FakeEvent(sender_id="u1", group_id="100", message_str="fav-rl")
+        results = asyncio.run(self._collect(self.plugin.cmd_fav_ranking(event, session_ctx=1)))
+        self.assertTrue(any("好感度排行" in msg for msg in results))
+
+    def test_session_context_decorator_hides_session_ctx_from_signature(self):
+        sig = inspect.signature(self.plugin.cmd_fav_ranking)
+        self.assertIn("event", sig.parameters)
+        self.assertNotIn("session_ctx", sig.parameters)
 
     def test_style_prompt_uses_effect_not_tier_name(self):
         self.plugin.tiers = [
